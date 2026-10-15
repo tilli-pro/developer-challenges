@@ -3,9 +3,12 @@ import { isInDictionary } from "./init";
 /**
  * The dictionary challenge.
  *
- * Determine if the `testString` param has `num` or more substrings that are words in the English dictionary.
+ * Determine if the `testString` param has `minWords` or more substrings that
+ * are words in the English dictionary. A word must be at least 2 characters
+ * long; shorter substrings never count.
  *
- * Use the `isInDictionary` function to check if a substring is a valid English word.
+ * Use the `isInDictionary` function to check if a substring is a valid English
+ * word. It already rejects strings shorter than 2 characters.
  *
  * @param testString
  * @param minWords The minimum number of words that must be in the dictionary.
