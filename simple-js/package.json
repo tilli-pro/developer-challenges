@@ -8,5 +8,8 @@
     "en-wordnet": "^2.0.11",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
+  },
+  "scripts": {
+    "sj": "tsx ."
   }
 }
