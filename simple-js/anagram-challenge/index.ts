@@ -1,4 +1,4 @@
-import type { Arg } from "../types";
+import type { Arg, Tags } from "../types";
 import { sample, shuffle } from "../utils";
 
 export const main = async (words: string) => {
@@ -10,6 +10,11 @@ export const main = async (words: string) => {
 };
 
 export const description = "Group a list of words into sets of anagrams.\n";
+export const tags: Tags = {
+  difficulty: "easy",
+  topics: ["strings", "hashing", "grouping"],
+  minutes: 15,
+};
 export const args: Arg[] = [
   {
     type: "arg",

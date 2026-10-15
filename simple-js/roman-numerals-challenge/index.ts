@@ -1,4 +1,4 @@
-import type { Arg } from "../types";
+import type { Arg, Tags } from "../types";
 import { randomInt } from "../utils";
 
 export const main = async (num: string) => {
@@ -10,6 +10,11 @@ export const main = async (num: string) => {
 
 export const description =
   "Convert an integer to its Roman numeral representation.\n";
+export const tags: Tags = {
+  difficulty: "easy",
+  topics: ["math", "strings", "lookup-table"],
+  minutes: 20,
+};
 export const args: Arg[] = [
   {
     type: "arg",

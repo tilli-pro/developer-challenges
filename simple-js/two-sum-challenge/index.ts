@@ -1,4 +1,4 @@
-import type { Arg } from "../types";
+import type { Arg, Tags } from "../types";
 import { randomInt, shuffle } from "../utils";
 
 export const main = async (prices: string, args: { budget: number }) => {
@@ -11,6 +11,11 @@ export const main = async (prices: string, args: { budget: number }) => {
 
 export const description =
   "Find two prices in a list that add up to a given budget.\n";
+export const tags: Tags = {
+  difficulty: "easy",
+  topics: ["arrays", "hashing"],
+  minutes: 15,
+};
 export const args: Arg[] = [
   {
     type: "arg",

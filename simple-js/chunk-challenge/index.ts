@@ -1,4 +1,4 @@
-import type { Arg } from "../types";
+import type { Arg, Tags } from "../types";
 import { randomInt } from "../utils";
 
 export const main = async (items: string, args: { size: number }) => {
@@ -11,6 +11,11 @@ export const main = async (items: string, args: { size: number }) => {
 
 export const description =
   "Split a list into consecutive groups of a given size.\n";
+export const tags: Tags = {
+  difficulty: "easy",
+  topics: ["arrays"],
+  minutes: 10,
+};
 export const args: Arg[] = [
   {
     type: "arg",

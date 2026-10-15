@@ -1,4 +1,4 @@
-import type { Arg } from "../types";
+import type { Arg, Tags } from "../types";
 import { pick, randomInt } from "../utils";
 
 export const main = async (
@@ -16,6 +16,11 @@ export const main = async (
 
 export const description =
   "Determine if any number of substrings in a test string are in the English dictionary.\n";
+export const tags: Tags = {
+  difficulty: "medium",
+  topics: ["strings", "search", "dynamic-programming"],
+  minutes: 30,
+};
 export const args: Arg[] = [
   {
     type: "arg",

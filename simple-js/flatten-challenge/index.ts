@@ -1,4 +1,4 @@
-import type { Arg } from "../types";
+import type { Arg, Tags } from "../types";
 import { randomInt } from "../utils";
 
 export const main = async (nested: string) => {
@@ -10,6 +10,11 @@ export const main = async (nested: string) => {
 
 export const description =
   "Flatten an arbitrarily nested array of numbers into a single array.\n";
+export const tags: Tags = {
+  difficulty: "easy",
+  topics: ["arrays", "recursion"],
+  minutes: 15,
+};
 export const args: Arg[] = [
   {
     type: "arg",

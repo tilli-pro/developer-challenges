@@ -1,4 +1,4 @@
-import type { Arg } from "../types";
+import type { Arg, Tags } from "../types";
 import { pick, sample } from "../utils";
 import type { Person } from "./challenge";
 
@@ -15,6 +15,11 @@ export const main = async (people: string) => {
 
 export const description =
   "Sort a list of people by age, then alphabetically by name.\n";
+export const tags: Tags = {
+  difficulty: "easy",
+  topics: ["arrays", "sorting", "comparators"],
+  minutes: 10,
+};
 export const args: Arg[] = [
   {
     type: "arg",

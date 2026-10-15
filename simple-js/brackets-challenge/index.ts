@@ -1,4 +1,4 @@
-import type { Arg } from "../types";
+import type { Arg, Tags } from "../types";
 import { pick } from "../utils";
 
 export const main = async (testString: string) => {
@@ -10,6 +10,11 @@ export const main = async (testString: string) => {
 
 export const description =
   "Determine whether the brackets in a string are correctly balanced.\n";
+export const tags: Tags = {
+  difficulty: "easy",
+  topics: ["strings", "stack"],
+  minutes: 15,
+};
 export const args: Arg[] = [
   {
     type: "arg",

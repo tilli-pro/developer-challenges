@@ -1,4 +1,4 @@
-import type { Arg } from "../types";
+import type { Arg, Tags } from "../types";
 import { randomInt, sample } from "../utils";
 
 export const main = async (urls: string) => {
@@ -10,6 +10,11 @@ export const main = async (urls: string) => {
 };
 
 export const description = "List the distinct hostnames in a list of URLs.\n";
+export const tags: Tags = {
+  difficulty: "easy",
+  topics: ["strings", "urls", "sets"],
+  minutes: 15,
+};
 export const args: Arg[] = [
   {
     type: "arg",

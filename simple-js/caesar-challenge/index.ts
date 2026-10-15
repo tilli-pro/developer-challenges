@@ -1,4 +1,4 @@
-import type { Arg } from "../types";
+import type { Arg, Tags } from "../types";
 import { pick } from "../utils";
 
 export const main = async (message: string, args: { shift: number }) => {
@@ -10,6 +10,11 @@ export const main = async (message: string, args: { shift: number }) => {
 
 export const description =
   "Encode a message by shifting each letter a fixed number of places in the alphabet.\n";
+export const tags: Tags = {
+  difficulty: "easy",
+  topics: ["strings", "math"],
+  minutes: 15,
+};
 export const args: Arg[] = [
   {
     type: "arg",

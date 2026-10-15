@@ -1,4 +1,4 @@
-import type { Arg } from "../types";
+import type { Arg, Tags } from "../types";
 import { sampleFilePath } from "./init";
 
 export const main = async (
@@ -13,6 +13,11 @@ export const main = async (
 
 export const description =
   "Find the most frequently occurring words in a text file.\n";
+export const tags: Tags = {
+  difficulty: "medium",
+  topics: ["strings", "files", "hashing", "sorting", "async"],
+  minutes: 25,
+};
 export const args: Arg[] = [
   {
     type: "arg",

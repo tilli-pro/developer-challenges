@@ -1,4 +1,4 @@
-import type { Arg } from "../types";
+import type { Arg, Tags } from "../types";
 import { pick } from "../utils";
 
 export const main = async (testString: string) => {
@@ -10,6 +10,11 @@ export const main = async (testString: string) => {
 
 export const description =
   "Determine whether a string reads the same forwards and backwards, ignoring case and punctuation.\n";
+export const tags: Tags = {
+  difficulty: "easy",
+  topics: ["strings", "two-pointers"],
+  minutes: 10,
+};
 export const args: Arg[] = [
   {
     type: "arg",

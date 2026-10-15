@@ -1,4 +1,4 @@
-import type { Arg } from "../types";
+import type { Arg, Tags } from "../types";
 import { randomInt } from "../utils";
 import type { Interval } from "./challenge";
 
@@ -15,6 +15,11 @@ export const main = async (intervals: string) => {
 
 export const description =
   "Merge overlapping time ranges into a single list of non-overlapping ranges.\n";
+export const tags: Tags = {
+  difficulty: "medium",
+  topics: ["arrays", "sorting", "intervals"],
+  minutes: 25,
+};
 export const args: Arg[] = [
   {
     type: "arg",

@@ -1,4 +1,4 @@
-import type { Arg } from "../types";
+import type { Arg, Tags } from "../types";
 import { pick } from "../utils";
 
 export const main = async (path: string, args: { object: string }) => {
@@ -10,6 +10,11 @@ export const main = async (path: string, args: { object: string }) => {
 
 export const description =
   "Read a value out of a nested object using a dot-separated path.\n";
+export const tags: Tags = {
+  difficulty: "easy",
+  topics: ["objects", "recursion"],
+  minutes: 15,
+};
 export const args: Arg[] = [
   {
     type: "arg",
