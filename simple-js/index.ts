@@ -81,11 +81,11 @@ for (const { dir, module } of challenges) {
   command.action((...actionArgs) => main(...actionArgs));
 }
 
-// --- random ----------------------------------------------------------------
+// --- tag filters (shared by list and random) --------------------------------
 
 const DIFFICULTIES = ["easy", "medium", "hard"] as const;
 
-type RandomOptions = {
+type TagFilters = {
   difficulty?: Tags["difficulty"];
   topics?: string[];
   maxMinutes?: number;
@@ -109,7 +109,7 @@ const parseMinutes = (value: string) => {
  * A challenge matches when it satisfies every filter that was given. If any
  * filter is given, challenges without a `tags` export never match.
  */
-const matchesFilters = (tags: Tags | undefined, options: RandomOptions) => {
+const matchesFilters = (tags: Tags | undefined, options: TagFilters) => {
   const { difficulty, topics, maxMinutes } = options;
   if (!difficulty && !topics && maxMinutes === undefined) {
     return true;
@@ -129,53 +129,107 @@ const matchesFilters = (tags: Tags | undefined, options: RandomOptions) => {
   return true;
 };
 
-program
-  .command("random")
-  .alias("rng")
-  .description("Run a random challenge, optionally filtered by its tags.")
-  .addOption(
-    new Option(
-      "-d, --difficulty <level>",
-      "Only challenges with this difficulty.",
-    ).choices(DIFFICULTIES),
-  )
-  .option(
-    "-t, --topics <topics>",
-    "Comma-separated topics. A challenge matches if it has at least one of them.",
-    parseTopics,
-  )
-  .option(
-    "-m, --max-minutes <minutes>",
-    "Only challenges expected to take at most this many minutes.",
-    parseMinutes,
-  )
-  .action(async (options: RandomOptions) => {
-    const matching = challenges.filter(({ module }) =>
-      matchesFilters(module.tags, options),
+/** Adds the shared `--difficulty`, `--topics` and `--max-minutes` options. */
+const withTagFilters = (command: Command) =>
+  command
+    .addOption(
+      new Option(
+        "-d, --difficulty <level>",
+        "Only challenges with this difficulty.",
+      ).choices(DIFFICULTIES),
+    )
+    .option(
+      "-t, --topics <topics>",
+      "Comma-separated topics. A challenge matches if it has at least one of them.",
+      parseTopics,
+    )
+    .option(
+      "-m, --max-minutes <minutes>",
+      "Only challenges expected to take at most this many minutes.",
+      parseMinutes,
     );
-    if (matching.length === 0) {
-      console.warn(
-        challenges.length === 0
-          ? "No challenges available to run."
-          : "No challenges match the given filters.",
-      );
-      return;
-    }
-    const { dir, module } = pick(matching);
-    const subcommand = run.commands.find((cmd) => cmd.name() === dir);
-    console.log(
-      `Running random challenge: "${dir}" (1 of ${matching.length} matching)`,
+
+// --- list ------------------------------------------------------------------
+
+withTagFilters(
+  program
+    .command("list")
+    .alias("ls")
+    .description("List the challenges and their tags, optionally filtered."),
+).action((options: TagFilters) => {
+  const matching = challenges.filter(({ module }) =>
+    matchesFilters(module.tags, options),
+  );
+  if (matching.length === 0) {
+    console.warn("No challenges match the given filters.");
+    return;
+  }
+  const columns = ["name", "difficulty", "minutes", "topics"] as const;
+  type Row = Record<(typeof columns)[number], string>;
+  const header: Row = {
+    name: "NAME",
+    difficulty: "DIFFICULTY",
+    minutes: "MINUTES",
+    topics: "TOPICS",
+  };
+  const rows: Row[] = matching.map(({ dir, module: { tags } }) => ({
+    name: dir.replace(/-challenge$/, ""),
+    difficulty: tags?.difficulty ?? "-",
+    minutes: tags ? String(tags.minutes) : "-",
+    topics: tags?.topics.join(", ") ?? "-",
+  }));
+  const widths = Object.fromEntries(
+    columns.map((key) => [
+      key,
+      Math.max(header[key].length, ...rows.map((row) => row[key].length)),
+    ]),
+  ) as Record<keyof Row, number>;
+  const line = (row: Row) =>
+    columns
+      .map((key) => row[key].padEnd(widths[key]))
+      .join("  ")
+      .trimEnd();
+  console.log(line(header));
+  for (const row of rows) {
+    console.log(line(row));
+  }
+  console.log(`\n${matching.length} of ${challenges.length} challenges`);
+});
+
+// --- random ----------------------------------------------------------------
+
+withTagFilters(
+  program
+    .command("random")
+    .alias("rng")
+    .description("Run a random challenge, optionally filtered by its tags."),
+).action(async (options: TagFilters) => {
+  const matching = challenges.filter(({ module }) =>
+    matchesFilters(module.tags, options),
+  );
+  if (matching.length === 0) {
+    console.warn(
+      challenges.length === 0
+        ? "No challenges available to run."
+        : "No challenges match the given filters.",
     );
-    if (module.tags) {
-      console.log("TAGGED:");
-      for (const tag in module.tags) {
-        console.log(`  ${tag}: ${module.tags[tag as keyof Tags]}`);
-      }
+    return;
+  }
+  const { dir, module } = pick(matching);
+  const subcommand = run.commands.find((cmd) => cmd.name() === dir);
+  console.log(
+    `Running random challenge: "${dir}" (1 of ${matching.length} matching)`,
+  );
+  if (module.tags) {
+    console.log("TAGGED:");
+    for (const tag in module.tags) {
+      console.log(`  ${tag}: ${module.tags[tag as keyof Tags]}`);
     }
-    console.log("\n");
-    // Parse the chosen subcommand with no user args so its generated
-    // defaults are applied and its action runs just like a direct invocation.
-    await subcommand?.parseAsync([], { from: "user" });
-  });
+  }
+  console.log("\n");
+  // Parse the chosen subcommand with no user args so its generated
+  // defaults are applied and its action runs just like a direct invocation.
+  await subcommand?.parseAsync([], { from: "user" });
+});
 
 program.parse();
