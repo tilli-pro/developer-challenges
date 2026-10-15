@@ -1,0 +1,12 @@
+{
+  "type": "module",
+  "dependencies": {
+    "@biomejs/biome": "^2.5.15",
+    "@types/node": "^26.6.5",
+    "commander": "^15.0.0",
+    "en-dictionary": "^2.0.3",
+    "en-wordnet": "^2.0.11",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
