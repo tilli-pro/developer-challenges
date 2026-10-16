@@ -1,0 +1,10 @@
+id,name,email,notes
+1,Ada Lovelace,ada@example.com,First programmer
+2,"Babbage, Charles",charles@example.com,Built the difference engine
+3,Grace Hopper,grace@example.com,"Coined the term ""bug"" in 1947"
+4,Alan Turing,alan@example.com,
+5,Margaret Hamilton,margaret@example.com,"Apollo flight software
+led the team at MIT"
+6,"Dijkstra, Edsger",edsger@example.com,"Said ""goto"" was harmful, famously"
+7,Linus Torvalds,,Wrote the kernel
+8,Barbara Liskov,barbara@example.com,Substitution principle
