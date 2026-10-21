@@ -8,6 +8,7 @@ import {
   loadProjects,
   matchesFilters,
 } from "./lib/projects";
+import { regen } from "./lib/regen";
 
 const projectsDir = join(import.meta.dirname, "projects");
 
@@ -156,6 +157,38 @@ program
       if (feature) {
         console.log(`\nAnswer key: ${join(feature.dir, "REVIEW.md")}`);
       }
+    },
+  );
+
+// --- regen -----------------------------------------------------------------
+
+program
+  .command("regen")
+  .description(
+    "Rewrite a feature's changes.patch from main..HEAD of its work dir.",
+  )
+  .argument("<project>", "Project slug.")
+  .argument("<feature>", "Feature slug.")
+  .option(
+    "--from <dir>",
+    "Work dir to diff. Defaults to .work/<project>-<feature>.",
+  )
+  .action(
+    async (
+      projectSlug: string,
+      featureSlug: string,
+      options: { from?: string },
+    ) => {
+      const { projects } = await loadProjects(projectsDir);
+      const project = findProject(projects, projectSlug);
+      const feature = findFeature(project, featureSlug);
+      const fromDir = options.from
+        ? resolve(options.from)
+        : workDirFor(import.meta.dirname, project, feature);
+      const result = await regen({ feature, fromDir });
+      console.log(
+        `Wrote ${result.patchPath} (${result.filesChanged} file(s) changed)`,
+      );
     },
   );
 
