@@ -1,6 +1,9 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Command, InvalidArgumentError, Option } from "commander";
-import { prepare, workDirFor } from "./lib/prepare";
+import { type CheckRow, checkFeature, rowOk } from "./lib/check";
+import { type PrepareResult, prepare, workDirFor } from "./lib/prepare";
 import {
   type Filters,
   findFeature,
@@ -10,6 +13,8 @@ import {
   matchesFilters,
 } from "./lib/projects";
 import { regen } from "./lib/regen";
+import type { Feature } from "./types";
+import { pick } from "./utils";
 
 const projectsDir = join(import.meta.dirname, "projects");
 
@@ -49,6 +54,20 @@ const withFilters = (command: Command) =>
       "Only features expected to take at most this many minutes.",
       parseMinutes,
     );
+
+const printPrepared = (result: PrepareResult, feature?: Feature) => {
+  console.log(`Prepared ${result.dir}`);
+  console.log(`  main`);
+  if (result.featureBranch) {
+    console.log(`  ${result.featureBranch} (checked out)`);
+  }
+  if (result.diffStat) {
+    console.log(`\n${result.diffStat}`);
+  }
+  if (feature) {
+    console.log(`\nAnswer key: ${join(feature.dir, "REVIEW.md")}`);
+  }
+};
 
 const program = new Command()
   .name("cr")
@@ -147,17 +166,7 @@ program
         install: options.install,
         force: options.force,
       });
-      console.log(`Prepared ${result.dir}`);
-      console.log(`  main`);
-      if (result.featureBranch) {
-        console.log(`  ${result.featureBranch} (checked out)`);
-      }
-      if (result.diffStat) {
-        console.log(`\n${result.diffStat}`);
-      }
-      if (feature) {
-        console.log(`\nAnswer key: ${join(feature.dir, "REVIEW.md")}`);
-      }
+      printPrepared(result, feature);
     },
   );
 
@@ -192,6 +201,99 @@ program
       );
     },
   );
+
+// --- check -----------------------------------------------------------------
+
+const mark = (ok: boolean) => (ok ? "✓" : "✗");
+
+const printCheckRows = (rows: CheckRow[]) => {
+  const names = rows.map((row) => `${row.project}/${row.feature}`);
+  const width = Math.max("FEATURE".length, ...names.map((name) => name.length));
+  console.log(
+    `${"FEATURE".padEnd(width)}  APPLIES  BASE-TC  BASE-TEST  FEAT-TC  FEAT-TEST`,
+  );
+  rows.forEach((row, index) => {
+    console.log(
+      [
+        (names[index] ?? "").padEnd(width),
+        mark(row.applies).padEnd(7),
+        mark(row.baseTypecheck).padEnd(8),
+        mark(row.baseTest).padEnd(9),
+        mark(row.featureTypecheck).padEnd(7),
+        mark(row.featureTest),
+      ].join("  "),
+    );
+    if (row.error) {
+      console.log(`    ${row.error}`);
+    }
+  });
+};
+
+program
+  .command("check")
+  .description(
+    "Apply each patch and run typecheck and test on main and the feature branch.",
+  )
+  .argument("[project]", "Project slug. Omit to check every project.")
+  .argument("[feature]", "Feature slug. Omit to check every feature.")
+  .action(
+    async (
+      projectSlug: string | undefined,
+      featureSlug: string | undefined,
+    ) => {
+      const { projects } = await loadProjects(projectsDir);
+      const selected = projectSlug
+        ? [findProject(projects, projectSlug)]
+        : projects;
+      const entries = selected.flatMap((project) => {
+        const features = featureSlug
+          ? [findFeature(project, featureSlug)]
+          : project.features;
+        return features.map((feature) => ({ project, feature }));
+      });
+      const tmpRoot = await mkdtemp(join(tmpdir(), "cr-check-"));
+      try {
+        const rows: CheckRow[] = [];
+        for (const { project, feature } of entries) {
+          rows.push(await checkFeature(project, feature, tmpRoot));
+        }
+        printCheckRows(rows);
+        if (!rows.every(rowOk)) {
+          process.exitCode = 1;
+        }
+      } finally {
+        await rm(tmpRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+// --- random ----------------------------------------------------------------
+
+withFilters(
+  program
+    .command("random")
+    .description("Prepare a random review feature, optionally filtered."),
+).action(async (options: Filters) => {
+  const { projects } = await loadProjects(projectsDir);
+  const entries = projects.flatMap((project) =>
+    project.features
+      .filter((feature) => matchesFilters(project, feature, options))
+      .map((feature) => ({ project, feature })),
+  );
+  if (entries.length === 0) {
+    throw new Error("No features match those filters.");
+  }
+  const { project, feature } = pick(entries);
+  console.log(`Running: ${project.slug}/${feature.slug}`);
+  const result = await prepare({
+    project,
+    feature,
+    outDir: workDirFor(import.meta.dirname, project, feature),
+    install: true,
+    force: false,
+  });
+  printPrepared(result, feature);
+});
 
 program.parseAsync().catch((error: unknown) => {
   console.error(error instanceof Error ? error.message : error);
