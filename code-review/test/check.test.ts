@@ -88,3 +88,23 @@ test("checkFeature reports featureTest=false when the patch makes test exit 1", 
     assert.equal(row.featureTest, false);
   });
 });
+
+test("checkFeature reports a failed checkout as an error row", async () => {
+  await withTempFixtures(async (dir) => {
+    // The base typecheck dirties a file the patch also edits, so switching to
+    // the feature branch fails.
+    const basePackage = join(dir, "demo", "base", "package.json");
+    const pkg = JSON.parse(await readFile(basePackage, "utf8"));
+    pkg.scripts.typecheck =
+      "node -e \"require('node:fs').appendFileSync('src/index.ts', '// dirty\\\\n')\"";
+    await writeFile(basePackage, JSON.stringify(pkg, null, 2));
+    const { project, feature } = await setup(dir, addConstant);
+    const row = await checkFeature(project, feature, join(dir, "..", "tmp"));
+    assert.equal(row.applies, true);
+    assert.ok(row.error && row.error.length > 0);
+    assert.equal(row.baseTypecheck, true);
+    assert.equal(row.baseTest, true);
+    assert.equal(row.featureTypecheck, false);
+    assert.equal(row.featureTest, false);
+  });
+});

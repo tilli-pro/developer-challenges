@@ -70,11 +70,7 @@ export const checkFeature = async (
     row.featureTypecheck = await script("typecheck", dir);
     row.featureTest = await script("test", dir);
   } catch (error) {
-    if (!row.applies) {
-      row.error = error instanceof Error ? error.message : String(error);
-    } else {
-      throw error;
-    }
+    row.error = error instanceof Error ? error.message : String(error);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
