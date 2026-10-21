@@ -1,6 +1,13 @@
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { Command, InvalidArgumentError, Option } from "commander";
-import { type Filters, loadProjects, matchesFilters } from "./lib/projects";
+import { prepare, workDirFor } from "./lib/prepare";
+import {
+  type Filters,
+  findFeature,
+  findProject,
+  loadProjects,
+  matchesFilters,
+} from "./lib/projects";
 
 const projectsDir = join(import.meta.dirname, "projects");
 
@@ -104,6 +111,53 @@ withFilters(
     console.error(`warn: ${warning}`);
   }
 });
+
+// --- prepare ---------------------------------------------------------------
+
+program
+  .command("prepare")
+  .description(
+    "Create a git repo with the project on main and the feature on feature/<slug>.",
+  )
+  .argument("<project>", "Project slug.")
+  .argument("[feature]", "Feature slug. Omit to prepare the base only.")
+  .option("-o, --out <dir>", "Directory to create. Defaults to .work/<name>.")
+  .option("--no-install", "Skip pnpm install.")
+  .option("--force", "Replace the directory if it already exists.", false)
+  .action(
+    async (
+      projectSlug: string,
+      featureSlug: string | undefined,
+      options: { out?: string; install: boolean; force: boolean },
+    ) => {
+      const { projects } = await loadProjects(projectsDir);
+      const project = findProject(projects, projectSlug);
+      const feature = featureSlug
+        ? findFeature(project, featureSlug)
+        : undefined;
+      const outDir = options.out
+        ? resolve(options.out)
+        : workDirFor(import.meta.dirname, project, feature);
+      const result = await prepare({
+        project,
+        ...(feature && { feature }),
+        outDir,
+        install: options.install,
+        force: options.force,
+      });
+      console.log(`Prepared ${result.dir}`);
+      console.log(`  main`);
+      if (result.featureBranch) {
+        console.log(`  ${result.featureBranch} (checked out)`);
+      }
+      if (result.diffStat) {
+        console.log(`\n${result.diffStat}`);
+      }
+      if (feature) {
+        console.log(`\nAnswer key: ${join(feature.dir, "REVIEW.md")}`);
+      }
+    },
+  );
 
 program.parseAsync().catch((error: unknown) => {
   console.error(error instanceof Error ? error.message : error);
