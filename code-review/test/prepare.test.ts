@@ -106,7 +106,12 @@ test("prepare removes the work dir when the patch does not apply", async () => {
     const project = await load(dir);
     const feature = findFeature(project, "hello");
     const outDir = workDirFor(join(dir, ".."), project, feature);
-    await assert.rejects(prepare({ ...options, project, feature, outDir }));
+    await assert.rejects(
+      prepare({ ...options, project, feature, outDir }),
+      (error: Error) =>
+        /missing\.ts/.test(error.message) &&
+        !/already exists/.test(error.message),
+    );
     assert.equal(existsSync(outDir), false);
   });
 });
@@ -116,6 +121,9 @@ test("prepare commits without global git identity", async () => {
     const project = await load(dir);
     const outDir = workDirFor(join(dir, ".."), project);
     await prepare({ ...options, project, outDir });
-    assert.match(await git(["log", "-1", "--format=%an"], outDir), /\S/);
+    assert.equal(
+      await git(["log", "-1", "--format=%an <%ae>|%cn <%ce>"], outDir),
+      "Code Review <code-review@localhost>|Code Review <code-review@localhost>",
+    );
   });
 });

@@ -32,7 +32,7 @@ export const commitAll = async (
       "-c",
       "user.name=Code Review",
       "-c",
-      "user.email=code-review@example.com",
+      "user.email=code-review@localhost",
       "commit",
       "-q",
       ...messages,

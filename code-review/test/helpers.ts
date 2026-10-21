@@ -6,8 +6,14 @@ import { setGitEnvForTests } from "../lib/git";
 export const fixturesDir = join(import.meta.dirname, "fixtures", "projects");
 
 /** Environment that hides the machine's global and system git config. */
+const inherited = Object.fromEntries(
+  Object.entries(process.env).filter(
+    ([key]) => !/^GIT_(AUTHOR|COMMITTER)_/.test(key),
+  ),
+);
+
 export const gitEnv = {
-  ...process.env,
+  ...inherited,
   GIT_CONFIG_GLOBAL: "/dev/null",
   GIT_CONFIG_SYSTEM: "/dev/null",
 };
