@@ -1,0 +1,6 @@
+{
+  "name": "hello",
+  "title": "Add a greeting",
+  "body": "Adds a greeting helper.",
+  "tags": { "difficulty": "easy", "focus": ["correctness"], "minutes": 5 }
+}
