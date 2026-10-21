@@ -5,6 +5,7 @@ import {
   type Filters,
   findFeature,
   findProject,
+  loadFeature,
   loadProjects,
   matchesFilters,
 } from "./lib/projects";
@@ -181,7 +182,7 @@ program
     ) => {
       const { projects } = await loadProjects(projectsDir);
       const project = findProject(projects, projectSlug);
-      const feature = findFeature(project, featureSlug);
+      const feature = await loadFeature(project.dir, featureSlug);
       const fromDir = options.from
         ? resolve(options.from)
         : workDirFor(import.meta.dirname, project, feature);

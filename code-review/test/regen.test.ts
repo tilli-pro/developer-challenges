@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { commitAll, git } from "../lib/git";
 import { prepare, workDirFor } from "../lib/prepare";
-import { findFeature, findProject, loadProjects } from "../lib/projects";
+import {
+  findFeature,
+  findProject,
+  loadFeature,
+  loadProjects,
+} from "../lib/projects";
 import { regen } from "../lib/regen";
 import { withTempFixtures } from "./helpers";
 
@@ -43,5 +48,33 @@ test("regen refuses when HEAD equals main", async () => {
   await withTempFixtures(async (dir) => {
     const { feature, fromDir } = await setup(dir);
     await assert.rejects(regen({ feature, fromDir }), /No changes/);
+  });
+});
+
+test("regen works for a feature that has no changes.patch yet", async () => {
+  await withTempFixtures(async (dir) => {
+    const { feature: seeded, fromDir } = await setup(dir);
+    await rm(seeded.patchPath);
+    const project = findProject((await loadProjects(dir)).projects, "demo");
+    assert.equal(project.features.length, 0);
+    const feature = await loadFeature(project.dir, "hello");
+    const file = join(fromDir, "src", "index.ts");
+    await writeFile(
+      file,
+      `${await readFile(file, "utf8")}export const added = 1;\n`,
+    );
+    await commitAll(fromDir, "Add constant");
+    const result = await regen({ feature, fromDir });
+    assert.equal(result.filesChanged, 1);
+    assert.match(await readFile(feature.patchPath, "utf8"), /added = 1/);
+  });
+});
+
+test("loadFeature rejects a missing feature.json", async () => {
+  await withTempFixtures(async (dir) => {
+    await assert.rejects(
+      loadFeature(join(dir, "demo"), "nope"),
+      /Unknown feature: demo\/nope/,
+    );
   });
 });

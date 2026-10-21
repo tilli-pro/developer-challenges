@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type {
   Difficulty,
   Feature,
@@ -17,6 +17,24 @@ const subdirs = async (dir: string) =>
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
     .sort();
+
+/** Reads `features/<slug>/feature.json`; `patchPath` is set even if changes.patch does not exist yet. */
+export const loadFeature = async (
+  projectDir: string,
+  slug: string,
+): Promise<Feature> => {
+  const dir = join(projectDir, "features", slug);
+  const metaPath = join(dir, "feature.json");
+  if (!existsSync(metaPath)) {
+    throw new Error(`Unknown feature: ${basename(projectDir)}/${slug}`);
+  }
+  return {
+    slug,
+    dir,
+    patchPath: join(dir, "changes.patch"),
+    meta: await readJson<FeatureMeta>(metaPath),
+  };
+};
 
 const loadFeatures = async (
   projectSlug: string,
@@ -37,12 +55,7 @@ const loadFeatures = async (
       );
       continue;
     }
-    features.push({
-      slug,
-      dir,
-      patchPath,
-      meta: await readJson<FeatureMeta>(join(dir, "feature.json")),
-    });
+    features.push(await loadFeature(projectDir, slug));
   }
   return features;
 };
