@@ -40,5 +40,7 @@
     "noUncheckedSideEffectImports": true,
     "moduleDetection": "force",
     "skipLibCheck": true
-  }
+  },
+  // Each projects/*/base (and its .work copy) typechecks with its own config.
+  "exclude": ["node_modules", "projects", ".work"]
 }

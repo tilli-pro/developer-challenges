@@ -6,6 +6,10 @@
     "defaultBranch": "main",
     "useIgnoreFile": true
   },
+  "files": {
+    // Each projects/*/base is its own root (biome check from inside it).
+    "includes": ["**", "!!projects"]
+  },
   "formatter": {
     "enabled": true,
     "indentStyle": "space",

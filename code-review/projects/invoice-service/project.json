@@ -1,0 +1,15 @@
+{
+  "name": "invoice-service",
+  "description": "Invoices, line items, tax and status transitions for a billing team.",
+  "tags": {
+    "domain": "billing",
+    "minutes": 45,
+    "topics": ["http", "sqlite", "money", "state-machine"]
+  },
+  "walkthrough": [
+    "Status transitions are enforced in src/routes/invoices.ts (requireStatus), not in the service, so InvoiceService.issue/pay/void will happily move an invoice from any state; ask where the rule belongs and what breaks when a second caller (a job, another route) uses the service.",
+    "Two error shapes: HttpError and errorHandler in src/lib/errors.ts reply { error: { code, message } }, while src/auth.ts replies { error: \"unauthorized\" } / { error: \"forbidden\" } directly; ask what a client has to do to handle both.",
+    "No index on invoices.customer_id (src/db.ts MIGRATIONS) while the list route filters on customer_id and does ORDER BY created_at DESC, id DESC (src/repositories/invoices.ts list); ask what the query plan looks like at a million invoices and which composite index fits.",
+    "InvoiceService.pay (src/services/invoices.ts) calls PaymentProvider.charge before updating status and sends no idempotency key, so a crash or retry between the charge and the UPDATE can double-charge; ask how they would make it safe."
+  ]
+}
