@@ -1,0 +1,6 @@
+{
+  "name": "demo",
+  "description": "A tiny demo project.",
+  "tags": { "domain": "web", "minutes": 10, "topics": ["demo"] },
+  "walkthrough": ["src/index.ts"]
+}

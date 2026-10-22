@@ -1,0 +1,320 @@
+diff --git a/src/app.ts b/src/app.ts
+index d1433a3..f8f6315 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -7,8 +7,12 @@ import { InvoiceRepository } from "./repositories/invoices";
+ import { invoiceRoutes } from "./routes/invoices";
+ import {
+   type Clock,
++  type CustomerDirectory,
++  FakeCustomerDirectory,
++  FakeMailer,
+   FakePaymentProvider,
+   InvoiceService,
++  type Mailer,
+ } from "./services/invoices";
+ 
+ export type AppOptions = {
+@@ -16,6 +20,10 @@ export type AppOptions = {
+   db?: DatabaseSync;
+   /** Source of "now" for every timestamp the service writes. */
+   clock?: Clock;
++  /** Sends reminder emails; an in-process fake unless one is passed. */
++  mailer?: Mailer;
++  /** Where customer billing emails come from; also faked by default. */
++  directory?: CustomerDirectory;
+   /** Request logging; off by default so tests stay quiet. */
+   logger?: boolean;
+ };
+@@ -27,6 +35,8 @@ export function buildApp(options: AppOptions = {}): FastifyInstance {
+     new InvoiceRepository(db),
+     clock,
+     new FakePaymentProvider(),
++    options.mailer ?? new FakeMailer(),
++    options.directory ?? new FakeCustomerDirectory(),
+   );
+ 
+   const app = Fastify({ logger: options.logger ?? false });
+diff --git a/src/db.ts b/src/db.ts
+index e4c1b02..04d6710 100644
+--- a/src/db.ts
++++ b/src/db.ts
+@@ -27,6 +27,8 @@ export const MIGRATIONS: string[] = [
+     position INTEGER NOT NULL
+   )`,
+   "CREATE INDEX invoice_lines_invoice_id ON invoice_lines (invoice_id, position)",
++  // When the overdue payment reminder went out; NULL until it has.
++  "ALTER TABLE invoices ADD COLUMN reminder_sent_at TEXT",
+ ];
+ 
+ export function openDb(
+diff --git a/src/repositories/invoices.ts b/src/repositories/invoices.ts
+index f296e9e..8cf82d1 100644
+--- a/src/repositories/invoices.ts
++++ b/src/repositories/invoices.ts
+@@ -143,6 +143,31 @@ export class InvoiceRepository {
+       .run({ ...update, id });
+   }
+ 
++  /**
++   * Issued invoices past their due date, after the grace period, that have
++   * not had a reminder yet. `today` is a `YYYY-MM-DD` date in UTC.
++   */
++  findOverdueUnreminded(today: string): InvoiceRecord[] {
++    const rows = this.db
++      .prepare(
++        `SELECT * FROM invoices
++         WHERE status = 'issued'
++           AND reminder_sent_at IS NULL
++           AND date(due_at) <= date(?, '-3 days')
++         ORDER BY due_at, id`,
++      )
++      .all(today);
++
++    const lines = this.linesFor(rows.map((row) => row.id as string));
++    return rows.map((row) => toRecord(row, lines.get(row.id as string) ?? []));
++  }
++
++  markReminded(id: string, sentAt: string): void {
++    this.db
++      .prepare("UPDATE invoices SET reminder_sent_at = ? WHERE id = ?")
++      .run(sentAt, id);
++  }
++
+   private insertLine(invoiceId: string, line: Line, position: number): void {
+     this.db
+       .prepare(
+diff --git a/src/routes/invoices.ts b/src/routes/invoices.ts
+index 19bbc75..8b4c4f6 100644
+--- a/src/routes/invoices.ts
++++ b/src/routes/invoices.ts
+@@ -14,6 +14,7 @@ import {
+   payInvoiceSchema,
+   type RemoveLineRoute,
+   removeLineSchema,
++  runRemindersSchema,
+ } from "../schemas";
+ import type { InvoiceService } from "../services/invoices";
+ 
+@@ -99,4 +100,12 @@ export function invoiceRoutes(
+       return service.void(request.params.id);
+     },
+   );
++
++  // Admin only: the API key hook already turns a readonly key away from any
++  // POST. Meant to be called by the scheduler once a day.
++  app.post(
++    "/invoices/reminders/run",
++    { schema: runRemindersSchema },
++    async () => service.sendReminders(),
++  );
+ }
+diff --git a/src/schemas.ts b/src/schemas.ts
+index 17cad59..ea9bbb7 100644
+--- a/src/schemas.ts
++++ b/src/schemas.ts
+@@ -64,6 +64,8 @@ export type PayInvoiceRoute = {
+   Body: { method: PaymentMethod };
+ };
+ 
++export type ReminderRun = { scanned: number; sent: number; failed: number };
++
+ // JSON schemas. Fastify validates requests and serializes responses with these.
+ 
+ const cents = { type: "integer", minimum: 0 } as const;
+@@ -198,3 +200,19 @@ export const payInvoiceSchema = {
+   },
+   response: invoiceResponse,
+ } as const;
++
++/** POST /invoices/reminders/run: what the run did. */
++export const runRemindersSchema = {
++  response: {
++    200: {
++      type: "object",
++      additionalProperties: false,
++      required: ["scanned", "sent", "failed"],
++      properties: {
++        scanned: { type: "integer" },
++        sent: { type: "integer" },
++        failed: { type: "integer" },
++      },
++    },
++  },
++} as const;
+diff --git a/src/services/invoices.ts b/src/services/invoices.ts
+index 7a691f4..8d88364 100644
+--- a/src/services/invoices.ts
++++ b/src/services/invoices.ts
+@@ -14,6 +14,7 @@ import {
+   type ListInvoicesQuery,
+   MAX_LINES,
+   type PaymentMethod,
++  type ReminderRun,
+ } from "../schemas";
+ import { computeTotals } from "./totals";
+ 
+@@ -52,6 +53,46 @@ export class FakePaymentProvider implements PaymentProvider {
+   }
+ }
+ 
++export type Email = { to: string; subject: string; text: string };
++
++export interface Mailer {
++  send(email: Email): Promise<void>;
++}
++
++/** In-process stand-in for the email provider; keeps what it was sent. */
++export class FakeMailer implements Mailer {
++  readonly sent: Email[] = [];
++
++  async send(email: Email): Promise<void> {
++    this.sent.push(email);
++  }
++}
++
++/** Billing contacts, kept in the CRM. */
++export interface CustomerDirectory {
++  lookup(customerId: string): Promise<string | null>;
++  lookupMany(customerIds: string[]): Promise<Map<string, string>>;
++}
++
++/** In-process stand-in for the CRM. Unknown customers get a placeholder. */
++export class FakeCustomerDirectory implements CustomerDirectory {
++  constructor(
++    private readonly emails = new Map([["cus_acme", "billing@acme.example"]]),
++  ) {}
++
++  async lookup(customerId: string): Promise<string | null> {
++    return this.emails.get(customerId) ?? `${customerId}@example.com`;
++  }
++
++  async lookupMany(customerIds: string[]): Promise<Map<string, string>> {
++    const found = new Map<string, string>();
++    for (const id of customerIds) {
++      found.set(id, this.emails.get(id) ?? `${id}@example.com`);
++    }
++    return found;
++  }
++}
++
+ type Cursor = NonNullable<InvoiceFilter["after"]>;
+ 
+ const encodeCursor = (invoice: Cursor): string =>
+@@ -72,6 +113,8 @@ export class InvoiceService {
+     private readonly repo: InvoiceRepository,
+     private readonly clock: Clock,
+     private readonly payments: PaymentProvider,
++    private readonly mailer: Mailer,
++    private readonly directory: CustomerDirectory,
+   ) {}
+ 
+   create(input: CreateInvoiceBody): Invoice {
+@@ -188,6 +231,36 @@ export class InvoiceService {
+     return this.get(id);
+   }
+ 
++  /** Emails every overdue invoice that has not had a reminder yet. */
++  async sendReminders(): Promise<ReminderRun> {
++    const now = this.now();
++    const overdue = this.repo.findOverdueUnreminded(now.slice(0, 10));
++    const run: ReminderRun = { scanned: overdue.length, sent: 0, failed: 0 };
++
++    for (const record of overdue) {
++      const invoice = withTotals(record);
++      const to = await this.directory.lookup(invoice.customerId);
++      if (!to) {
++        // No billing contact on file; leave it for the next run.
++        run.failed++;
++        continue;
++      }
++
++      try {
++        await this.mailer.send({
++          to,
++          subject: `Invoice ${invoice.number} is overdue`,
++          text: reminderText(invoice),
++        });
++        run.sent++;
++      } catch {
++        run.failed++;
++      }
++      this.repo.markReminded(invoice.id, now);
++    }
++    return run;
++  }
++
+   private now(): string {
+     return this.clock().toISOString();
+   }
+@@ -196,3 +269,13 @@ export class InvoiceService {
+ function withTotals(record: InvoiceRecord): Invoice {
+   return { ...record, ...computeTotals(record.lines) };
+ }
++
++function reminderText(invoice: Invoice): string {
++  const amount = (invoice.totalCents / 100).toFixed(2);
++  const due = invoice.dueAt?.slice(0, 10);
++  return [
++    `Invoice ${invoice.number} for ${amount} ${invoice.currency} was due on ${due}`,
++    "and is now more than 3 days overdue. If you have already paid, please",
++    "ignore this email.",
++  ].join("\n");
++}
+diff --git a/test/invoices.test.ts b/test/invoices.test.ts
+index 3a8c357..074c406 100644
+--- a/test/invoices.test.ts
++++ b/test/invoices.test.ts
+@@ -1,10 +1,13 @@
+ import assert from "node:assert/strict";
+ import { afterEach, beforeEach, describe, it } from "node:test";
+ import type { FastifyInstance } from "fastify";
++import { buildApp } from "../src/app";
+ import type { Invoice, InvoicePage } from "../src/schemas";
++import type { Email } from "../src/services/invoices";
+ import {
+   ADMIN,
+   createInvoice,
++  NOW,
+   READONLY,
+   sampleInvoice,
+   testApp,
+@@ -137,3 +140,38 @@ describe("invoices API", () => {
+     assert.equal(seen.size, 3);
+   });
+ });
++
++describe("payment reminders", () => {
++  it("emails customers about overdue invoices", async () => {
++    const sent: Email[] = [];
++    const app = buildApp({
++      clock: () => NOW,
++      mailer: {
++        send: async (email) => {
++          sent.push(email);
++        },
++      },
++    });
++
++    const overdue = await createInvoice(
++      app,
++      sampleInvoice({ dueAt: "2026-01-01T00:00:00.000Z" }),
++    );
++    await app.inject({
++      method: "POST",
++      url: `/invoices/${overdue.id}/issue`,
++      headers: ADMIN,
++    });
++    await createInvoice(app); // still a draft, so no reminder
++
++    const response = await app.inject({
++      method: "POST",
++      url: "/invoices/reminders/run",
++      headers: ADMIN,
++    });
++    assert.equal(response.statusCode, 200);
++    assert.equal(response.json().sent, 1);
++
++    await app.close();
++  });
++});

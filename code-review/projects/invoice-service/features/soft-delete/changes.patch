@@ -1,0 +1,330 @@
+diff --git a/src/auth.ts b/src/auth.ts
+index b3ee9f4..cbb8725 100644
+--- a/src/auth.ts
++++ b/src/auth.ts
+@@ -2,7 +2,16 @@ import type { FastifyReply, FastifyRequest } from "fastify";
+ 
+ export type Role = "admin" | "readonly";
+ 
+-const READ_METHODS = new Set(["GET", "HEAD"]);
++declare module "fastify" {
++  interface FastifyRequest {
++    /** Set by `apiKeyAuth` once the key is known. */
++    role?: Role;
++  }
++}
++
++// The support tool runs with the readonly key and cleans up the test invoices
++// people create on production, so it needs DELETE as well.
++const READ_METHODS = new Set(["GET", "HEAD", "DELETE"]);
+ 
+ /** API keys come from the environment; the defaults are for local use only. */
+ export function loadApiKeys(env: NodeJS.ProcessEnv = process.env) {
+@@ -30,5 +39,6 @@ export function apiKeyAuth(keys: Map<string, Role> = loadApiKeys()) {
+     if (role === "readonly" && !READ_METHODS.has(request.method)) {
+       return reply.code(403).send({ error: "forbidden" });
+     }
++    request.role = role;
+   };
+ }
+diff --git a/src/db.ts b/src/db.ts
+index e4c1b02..b18cab1 100644
+--- a/src/db.ts
++++ b/src/db.ts
+@@ -27,6 +27,8 @@ export const MIGRATIONS: string[] = [
+     position INTEGER NOT NULL
+   )`,
+   "CREATE INDEX invoice_lines_invoice_id ON invoice_lines (invoice_id, position)",
++  // Soft delete: NULL means the invoice is live.
++  "ALTER TABLE invoices ADD COLUMN deleted_at INTEGER DEFAULT NULL",
+ ];
+ 
+ export function openDb(
+diff --git a/src/repositories/invoices.ts b/src/repositories/invoices.ts
+index f296e9e..e21c336 100644
+--- a/src/repositories/invoices.ts
++++ b/src/repositories/invoices.ts
+@@ -6,12 +6,13 @@ import type { Invoice, InvoiceStatus, Line } from "../schemas";
+ /** An invoice as stored: everything except the derived totals. */
+ export type InvoiceRecord = Omit<
+   Invoice,
+-  "subtotalCents" | "taxCents" | "totalCents"
++  "subtotalCents" | "taxCents" | "totalCents" | "isDeleted"
+ >;
+ 
+ export type InvoiceFilter = {
+   customerId?: string | undefined;
+   status?: InvoiceStatus | undefined;
++  includeDeleted?: boolean | undefined;
+   /** Keyset position: return rows strictly after this one. */
+   after?: { createdAt: string; id: string } | undefined;
+   limit: number;
+@@ -44,6 +45,7 @@ const toRecord = (row: Row, lines: Line[]): InvoiceRecord => ({
+   lines,
+   createdAt: row.created_at as string,
+   updatedAt: row.updated_at as string,
++  deletedAt: row.deleted_at === null ? null : Number(row.deleted_at),
+ });
+ 
+ export class InvoiceRepository {
+@@ -66,9 +68,9 @@ export class InvoiceRepository {
+       .prepare(
+         `INSERT INTO invoices
+            (id, number, customer_id, status, currency, issued_at, due_at,
+-            paid_at, created_at, updated_at)
++            paid_at, created_at, updated_at, deleted_at)
+          VALUES (:id, :number, :customerId, :status, :currency, :issuedAt,
+-                 :dueAt, :paidAt, :createdAt, :updatedAt)`,
++                 :dueAt, :paidAt, :createdAt, :updatedAt, :deletedAt)`,
+       )
+       .run(row);
+     lines.forEach((line, position) => {
+@@ -82,9 +84,21 @@ export class InvoiceRepository {
+     return toRecord(row, this.linesFor([id]).get(id) ?? []);
+   }
+ 
++  /** Only returns the invoice if it has been soft-deleted. */
++  findDeleted(id: string): InvoiceRecord | null {
++    const row = this.db
++      .prepare("SELECT * FROM invoices WHERE id = ? AND deleted_at IS NOT NULL")
++      .get(id);
++    if (!row) return null;
++    return toRecord(row, this.linesFor([id]).get(id) ?? []);
++  }
++
+   list(filter: InvoiceFilter): InvoiceRecord[] {
+     const where: string[] = [];
+     const params: SQLInputValue[] = [];
++    if (!filter.includeDeleted) {
++      where.push("deleted_at IS NULL");
++    }
+     if (filter.customerId !== undefined) {
+       where.push("customer_id = ?");
+       params.push(filter.customerId);
+@@ -143,6 +157,22 @@ export class InvoiceRepository {
+       .run({ ...update, id });
+   }
+ 
++  softDelete(id: string, deletedAt: number, updatedAt: string): void {
++    this.db
++      .prepare(
++        "UPDATE invoices SET deleted_at = ?, updated_at = ? WHERE id = ?",
++      )
++      .run(deletedAt, updatedAt, id);
++  }
++
++  restore(id: string, updatedAt: string): void {
++    this.db
++      .prepare(
++        "UPDATE invoices SET deleted_at = NULL, updated_at = ? WHERE id = ?",
++      )
++      .run(updatedAt, id);
++  }
++
+   private insertLine(invoiceId: string, line: Line, position: number): void {
+     this.db
+       .prepare(
+diff --git a/src/routes/invoices.ts b/src/routes/invoices.ts
+index 19bbc75..67278d9 100644
+--- a/src/routes/invoices.ts
++++ b/src/routes/invoices.ts
+@@ -1,5 +1,5 @@
+ import type { FastifyInstance } from "fastify";
+-import { conflict } from "../lib/errors";
++import { conflict, HttpError, notFound } from "../lib/errors";
+ import {
+   type AddLineRoute,
+   addLineSchema,
+@@ -45,13 +45,41 @@ export function invoiceRoutes(
+   app.get<ListInvoicesRoute>(
+     "/invoices",
+     { schema: listInvoicesSchema },
+-    async (request) => service.list(request.query),
++    async (request) => {
++      if (request.query.includeDeleted && request.role !== "admin") {
++        throw new HttpError(
++          403,
++          "includeDeleted needs an admin key",
++          "forbidden",
++        );
++      }
++      return service.list(request.query);
++    },
+   );
+ 
+   app.get<InvoiceByIdRoute>(
+     "/invoices/:id",
+     { schema: invoiceByIdSchema },
+-    async (request) => service.get(request.params.id),
++    async (request) => {
++      const invoice = service.get(request.params.id);
++      if (invoice.deletedAt !== null) throw notFound("invoice");
++      return invoice;
++    },
++  );
++
++  app.delete<InvoiceByIdRoute>(
++    "/invoices/:id",
++    { schema: invoiceByIdSchema },
++    async (request) => {
++      requireStatus(request.params.id, ["draft", "void", "paid"], "delete");
++      return service.delete(request.params.id);
++    },
++  );
++
++  app.post<InvoiceByIdRoute>(
++    "/invoices/:id/restore",
++    { schema: invoiceByIdSchema },
++    async (request) => service.restore(request.params.id),
+   );
+ 
+   app.post<AddLineRoute>(
+diff --git a/src/schemas.ts b/src/schemas.ts
+index 17cad59..1874281 100644
+--- a/src/schemas.ts
++++ b/src/schemas.ts
+@@ -28,6 +28,9 @@ export type Invoice = {
+   totalCents: number;
+   createdAt: string;
+   updatedAt: string;
++  isDeleted: boolean;
++  /** Epoch milliseconds, or null while the invoice is live. */
++  deletedAt: number | null;
+ };
+ 
+ export type LineInput = Omit<Line, "id">;
+@@ -46,6 +49,8 @@ export type ListInvoicesQuery = {
+   status?: InvoiceStatus;
+   limit: number;
+   cursor?: string;
++  /** Admin only: include soft-deleted invoices in the page. */
++  includeDeleted?: boolean;
+ };
+ 
+ export type InvoicePage = { items: Invoice[]; nextCursor: string | null };
+@@ -112,6 +117,8 @@ const invoiceProperties = {
+   totalCents: cents,
+   createdAt: dateTime,
+   updatedAt: dateTime,
++  isDeleted: { type: "boolean" },
++  deletedAt: { type: ["integer", "null"] },
+ } as const;
+ 
+ // Every field is always present in a response; nullable ones are sent as null.
+@@ -144,7 +151,10 @@ export const createInvoiceSchema = {
+   response: { 201: invoiceSchema },
+ } as const;
+ 
+-/** GET /invoices/:id and the bodiless transitions (issue, void). */
++/**
++ * GET /invoices/:id and the bodiless transitions (issue, void, delete,
++ * restore).
++ */
+ export const invoiceByIdSchema = {
+   params: invoiceParams,
+   response: invoiceResponse,
+@@ -159,6 +169,7 @@ export const listInvoicesSchema = {
+       status: { type: "string", enum: INVOICE_STATUSES },
+       limit: { type: "integer", minimum: 1, maximum: 100, default: 20 },
+       cursor: nonEmpty,
++      includeDeleted: { type: "boolean", default: false },
+     },
+   },
+   response: {
+diff --git a/src/services/invoices.ts b/src/services/invoices.ts
+index 7a691f4..898d288 100644
+--- a/src/services/invoices.ts
++++ b/src/services/invoices.ts
+@@ -90,6 +90,7 @@ export class InvoiceService {
+         lines: input.lines.map((line) => ({ id: randomUUID(), ...line })),
+         createdAt: now,
+         updatedAt: now,
++        deletedAt: null,
+       });
+     });
+     return this.get(id);
+@@ -106,6 +107,7 @@ export class InvoiceService {
+     const records = this.repo.list({
+       customerId: query.customerId,
+       status: query.status,
++      includeDeleted: query.includeDeleted,
+       after: query.cursor ? decodeCursor(query.cursor) : undefined,
+       limit: query.limit + 1,
+     });
+@@ -188,11 +190,28 @@ export class InvoiceService {
+     return this.get(id);
+   }
+ 
++  /** Soft delete: the row stays for the audit trail and can be restored. */
++  delete(id: string): Invoice {
++    this.get(id);
++    this.repo.softDelete(id, Date.now(), this.now());
++    return this.get(id);
++  }
++
++  restore(id: string): Invoice {
++    const deleted = this.repo.findDeleted(id) as InvoiceRecord;
++    this.repo.restore(deleted.id, this.now());
++    return this.get(id);
++  }
++
+   private now(): string {
+     return this.clock().toISOString();
+   }
+ }
+ 
+ function withTotals(record: InvoiceRecord): Invoice {
+-  return { ...record, ...computeTotals(record.lines) };
++  return {
++    ...record,
++    ...computeTotals(record.lines),
++    isDeleted: record.deletedAt !== null,
++  };
+ }
+diff --git a/test/invoices.test.ts b/test/invoices.test.ts
+index 3a8c357..c243f94 100644
+--- a/test/invoices.test.ts
++++ b/test/invoices.test.ts
+@@ -136,4 +136,42 @@ describe("invoices API", () => {
+     const seen = new Set([...page.items, ...rest.items].map((i) => i.id));
+     assert.equal(seen.size, 3);
+   });
++
++  it("soft-deletes a draft invoice", async () => {
++    const created = await createInvoice(app);
++
++    const response = await app.inject({
++      method: "DELETE",
++      url: `/invoices/${created.id}`,
++      headers: ADMIN,
++    });
++    assert.equal(response.statusCode, 200);
++    assert.equal(response.json<Invoice>().isDeleted, true);
++    assert.equal(response.json<Invoice>().id, created.id);
++  });
++
++  it("hides deleted invoices from the list unless asked", async () => {
++    const kept = await createInvoice(app);
++    const deleted = await createInvoice(app);
++    await app.inject({
++      method: "DELETE",
++      url: `/invoices/${deleted.id}`,
++      headers: ADMIN,
++    });
++
++    const list = await app.inject({
++      method: "GET",
++      url: "/invoices",
++      headers: ADMIN,
++    });
++    const ids = list.json<InvoicePage>().items.map((invoice) => invoice.id);
++    assert.deepEqual(ids, [kept.id]);
++
++    const all = await app.inject({
++      method: "GET",
++      url: "/invoices?includeDeleted=true",
++      headers: ADMIN,
++    });
++    assert.equal(all.json<InvoicePage>().items.length, 2);
++  });
+ });

@@ -1,0 +1,306 @@
+diff --git a/README.md b/README.md
+index 45f4ea9..22db28c 100644
+--- a/README.md
++++ b/README.md
+@@ -86,18 +86,32 @@ Admin routes need an `x-admin-key` header. Amounts are integer cents and
+ timestamps are ISO 8601 strings in UTC. Errors look like
+ `{ "error": { "code", "message" } }`.
+ 
+-| Method | Path                  | Notes                                 | Result                             |
+-| ------ | --------------------- | ------------------------------------- | ---------------------------------- |
+-| GET    | `/health`             |                                       | `{ ok: true }`                     |
+-| POST   | `/webhooks/acme`      | signed raw JSON body, see above       | 202 `{ eventId, status }`          |
+-|        |                       | an `id` we have already seen          | 200 `{ duplicate: true, eventId }` |
+-| GET    | `/admin/events`       | query: `status`, `limit` (default 50) | events, newest first               |
+-| GET    | `/admin/events/:id`   |                                       | the event, with its payload        |
+-| GET    | `/admin/payments/:id` | our payment id, as in outbox messages | the payment                        |
+-| POST   | `/admin/outbox/drain` | delivers due messages now             | `{ delivered, failed }`            |
++| Method | Path                       | Notes                                 | Result                             |
++| ------ | -------------------------- | ------------------------------------- | ---------------------------------- |
++| GET    | `/health`                  |                                       | `{ ok: true }`                     |
++| POST   | `/webhooks/acme`           | signed raw JSON body, see above       | 202 `{ eventId, status }`          |
++|        |                            | an `id` we have already seen          | 200 `{ duplicate: true, eventId }` |
++| GET    | `/admin/events`            | query: `status`, `limit` (default 50) | events, newest first               |
++| GET    | `/admin/events/:id`        |                                       | the event, with its payload        |
++| POST   | `/admin/events/:id/replay` | re-runs a stored event                | `{ ok: true }`                     |
++| GET    | `/admin/payments/:id`      | our payment id, as in outbox messages | the payment                        |
++| POST   | `/admin/outbox/drain`      | delivers due messages now             | `{ delivered, failed }`            |
+ 
+ An event's `status` is `received`, `processed` or `failed`; a failed event
+-keeps the error in `error`. A payment looks like this:
++keeps the error in `error`. Acme's retries of an event we already have are
++acknowledged as duplicates, so a failed event is not retried on its own; once
++the cause is fixed (for example the payment a refund belongs to has arrived),
++an operator replays it with `POST /admin/events/:id/replay`. Every event
++carries `replayCount` and `replayedAt`, the time of its last replay.
++
++```sh
++# find failed events, then replay one by its id
++curl -s 'localhost:3000/admin/events?status=failed' -H 'x-admin-key: admin-dev-key'
++curl -s -X POST localhost:3000/admin/events/<id>/replay \
++  -H 'x-admin-key: admin-dev-key'
++```
++
++A payment looks like this:
+ 
+ ```json
+ {
+diff --git a/src/app.ts b/src/app.ts
+index 79c64cf..d82896b 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -3,7 +3,7 @@ import Fastify, { type FastifyInstance } from "fastify";
+ import { adminKeyAuth } from "./auth";
+ import { openDb } from "./db";
+ import { errorHandler, notFoundHandler } from "./lib/errors";
+-import { adminRoutes } from "./routes/admin";
++import { adminRoutes, replayRoutes } from "./routes/admin";
+ import { webhookRoutes } from "./routes/webhooks";
+ import type { DrainResult } from "./schemas";
+ import { EventService } from "./services/events";
+@@ -60,6 +60,10 @@ export function buildApp(options: AppOptions = {}): FastifyInstance {
+     webhookRoutes(scope, { providers: loadProviders(), events, clock });
+   });
+ 
++  app.register(async (scope) => replayRoutes(scope, { events }), {
++    prefix: "/admin",
++  });
++
+   // Everything registered in this scope sits behind the admin key check.
+   app.register(async (admin) => {
+     admin.addHook("onRequest", adminKeyAuth());
+diff --git a/src/db.ts b/src/db.ts
+index 84f8143..147bd9a 100644
+--- a/src/db.ts
++++ b/src/db.ts
+@@ -40,6 +40,9 @@ export const MIGRATIONS: string[] = [
+     created_at TEXT NOT NULL
+   )`,
+   "CREATE INDEX outbox_pending ON outbox (next_attempt_at) WHERE delivered_at IS NULL",
++  // Replay audit: when an operator last replayed the event, and how often.
++  "ALTER TABLE events ADD COLUMN replayed_at TEXT",
++  "ALTER TABLE events ADD COLUMN replay_count INTEGER NOT NULL DEFAULT 0",
+ ];
+ 
+ export function openDb(
+diff --git a/src/routes/admin.ts b/src/routes/admin.ts
+index 4d68367..bf9e9e0 100644
+--- a/src/routes/admin.ts
++++ b/src/routes/admin.ts
+@@ -7,6 +7,7 @@ import {
+   type ListEventsRoute,
+   listEventsSchema,
+   paymentByIdSchema,
++  replayEventSchema,
+ } from "../schemas";
+ import type { EventService } from "../services/events";
+ 
+@@ -38,3 +39,30 @@ export function adminRoutes(
+     deps.drain(),
+   );
+ }
++
++/**
++ * Re-runs a stored event, for example one that failed because its payment had
++ * not arrived yet. Acme's retries of a failed event are acknowledged as
++ * duplicates, so without this a failed event stays failed.
++ */
++export function replayRoutes(
++  app: FastifyInstance,
++  deps: { events: EventService },
++): void {
++  app.post<ByIdRoute>(
++    "/events/:id/replay",
++    { schema: replayEventSchema },
++    async (request) => {
++      const { id } = request.params;
++      try {
++        deps.events.replay(id);
++      } catch (err) {
++        // processEvent has recorded the error and the replay itself ran, so
++        // don't leave the event sitting in the failed list.
++        request.log.warn({ err, eventId: id }, "replayed event threw");
++        deps.events.finishReplay(id);
++      }
++      return { ok: true };
++    },
++  );
++}
+diff --git a/src/schemas.ts b/src/schemas.ts
+index 9e0a4be..9308d1b 100644
+--- a/src/schemas.ts
++++ b/src/schemas.ts
+@@ -34,6 +34,9 @@ export type StoredEvent = {
+   error: string | null;
+   receivedAt: string;
+   processedAt: string | null;
++  /** When an operator last replayed the event, if ever. */
++  replayedAt: string | null;
++  replayCount: number;
+ };
+ 
+ export const PAYMENT_STATUSES = [
+@@ -88,6 +91,8 @@ const eventProperties = {
+   error: { type: ["string", "null"] },
+   receivedAt: dateTime,
+   processedAt: { ...dateTime, type: ["string", "null"] },
++  replayedAt: { ...dateTime, type: ["string", "null"] },
++  replayCount: cents,
+ } as const;
+ 
+ const eventSchema = {
+@@ -130,6 +135,17 @@ export const eventByIdSchema = {
+   response: { 200: eventSchema },
+ } as const;
+ 
++export const replayEventSchema = {
++  params: byIdParams,
++  response: {
++    200: {
++      type: "object",
++      required: ["ok"],
++      properties: { ok: { type: "boolean" } },
++    },
++  },
++} as const;
++
+ export const paymentByIdSchema = {
+   params: byIdParams,
+   response: { 200: paymentSchema },
+diff --git a/src/services/events.ts b/src/services/events.ts
+index 6bb5c82..c36940c 100644
+--- a/src/services/events.ts
++++ b/src/services/events.ts
+@@ -26,6 +26,20 @@ const toPayment = (row: Row): Payment => ({
+   updatedAt: row.updated_at as string,
+ });
+ 
++const toStoredEvent = (row: Row): StoredEvent => ({
++  id: row.id as string,
++  provider: row.provider as string,
++  externalId: row.external_id as string,
++  type: row.type as EventType,
++  payload: JSON.parse(row.payload as string),
++  status: row.status as EventStatus,
++  error: row.error as string | null,
++  receivedAt: row.received_at as string,
++  processedAt: row.processed_at as string | null,
++  replayedAt: row.replayed_at as string | null,
++  replayCount: Number(row.replay_count),
++});
++
+ /**
+  * Records provider events exactly once per (provider, external id) and applies
+  * them to `payments`, queueing a `payments.<status>` message for each change.
+@@ -180,6 +194,42 @@ export class EventService {
+     }
+   }
+ 
++  /**
++   * Runs a stored event through `processEvent` again, for an event that failed
++   * (say a refund that arrived before its payment) or one an operator wants
++   * re-applied. Records when it was replayed and how many times.
++   */
++  replay(eventId: string): void {
++    const row = this.db
++      .prepare("SELECT replay_count FROM events WHERE id = ?")
++      .get(eventId);
++    // Unknown id: nothing stored, so nothing to replay.
++    if (!row) return;
++
++    const replayCount = Number(row.replay_count) + 1;
++    // processEvent only picks up events in `received`, so put it back there.
++    this.db
++      .prepare(
++        `UPDATE events
++         SET status = 'received', error = NULL,
++           replayed_at = ?, replay_count = ?
++         WHERE id = ?`,
++      )
++      .run(Date.now(), replayCount, eventId);
++
++    this.processEvent(eventId);
++  }
++
++  /** Closes out a replay so the event no longer shows up as failed. */
++  finishReplay(eventId: string): void {
++    this.db
++      .prepare(
++        `UPDATE events SET status = 'processed', error = NULL, processed_at = ?
++         WHERE id = ?`,
++      )
++      .run(this.now(), eventId);
++  }
++
+   /** Newest first, optionally filtered by status. */
+   list(filter: { status?: EventStatus | undefined; limit: number }) {
+     const rows = this.db
+@@ -191,35 +241,13 @@ export class EventService {
+       )
+       .all({ status: filter.status ?? null, limit: filter.limit });
+ 
+-    return rows.map(
+-      (row): StoredEvent => ({
+-        id: row.id as string,
+-        provider: row.provider as string,
+-        externalId: row.external_id as string,
+-        type: row.type as EventType,
+-        payload: JSON.parse(row.payload as string),
+-        status: row.status as EventStatus,
+-        error: row.error as string | null,
+-        receivedAt: row.received_at as string,
+-        processedAt: row.processed_at as string | null,
+-      }),
+-    );
++    return rows.map(toStoredEvent);
+   }
+ 
+   get(id: string): StoredEvent {
+     const row = this.db.prepare("SELECT * FROM events WHERE id = ?").get(id);
+     if (!row) throw notFound("event");
+-    return {
+-      id: row.id as string,
+-      provider: row.provider as string,
+-      externalId: row.external_id as string,
+-      type: row.type as EventType,
+-      payload: JSON.parse(row.payload as string),
+-      status: row.status as EventStatus,
+-      error: row.error as string | null,
+-      receivedAt: row.received_at as string,
+-      processedAt: row.processed_at as string | null,
+-    };
++    return toStoredEvent(row);
+   }
+ 
+   payment(id: string): Payment {
+diff --git a/test/webhooks.test.ts b/test/webhooks.test.ts
+index 0db2461..5c0ed1a 100644
+--- a/test/webhooks.test.ts
++++ b/test/webhooks.test.ts
+@@ -114,4 +114,26 @@ describe("acme webhooks", () => {
+     assert.deepEqual(second.json(), { delivered: 0, failed: 0 });
+     assert.equal(ctx.publisher.published.length, 2);
+   });
++
++  it("replays a stored event and records the replay", async () => {
++    const response = await postWebhook(ctx.app, acmeEvent());
++    const { eventId } = response.json();
++
++    const replay = await ctx.app.inject({
++      method: "POST",
++      url: `/admin/events/${eventId}/replay`,
++      headers: ADMIN,
++    });
++    assert.equal(replay.statusCode, 200);
++    assert.deepEqual(replay.json(), { ok: true });
++
++    const event = await ctx.app.inject({
++      method: "GET",
++      url: `/admin/events/${eventId}`,
++      headers: ADMIN,
++    });
++    assert.equal(event.json().status, "processed");
++    assert.equal(event.json().error, null);
++    assert.equal(event.json().replayCount, 1);
++  });
+ });

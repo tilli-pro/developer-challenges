@@ -1,0 +1,462 @@
+diff --git a/README.md b/README.md
+index 45f4ea9..410e60f 100644
+--- a/README.md
++++ b/README.md
+@@ -38,6 +38,14 @@ pnpm lint         # biome
+ The server drains the outbox once a second. Locally the publisher is an
+ in-process fake that logs each message it delivers.
+ 
++### Retries and dead letters
++
++A failed message is retried after 1 s, 5 s, 30 s, 2 min, then every 10 min
++(`BACKOFF_SECONDS`), with the error in `outbox.last_error`. After 3 failed
++attempts (`MAX_ATTEMPTS`) it moves to `dead_letters` with that error.
++`GET /admin/dead-letters` lists them, newest first (query: `limit`). Once the
++cause is fixed, `POST /admin/dead-letters/:id/retry` puts one back.
++
+ ## Webhooks
+ 
+ Acme posts JSON events like this one:
+@@ -47,14 +55,21 @@ Acme posts JSON events like this one:
+   "id": "evt_123",
+   "type": "payment.succeeded",
+   "created": 1768435200,
+-  "data": { "paymentId": "pay_123", "amountCents": 12500, "currency": "USD" }
++  "data": {
++    "paymentId": "pay_123",
++    "amountCents": 12500,
++    "currency": "USD",
++    "customer": { "email": "ana@example.com", "cardLast4": "4242" }
++  }
+ }
+ ```
+ 
+ `type` is one of `payment.succeeded`, `payment.failed` or `refund.created`.
+ `data.amountCents` is a positive integer number of cents, `data.currency` an
+-ISO 4217 code, and refunds may carry a free-text `data.reason`. Acme retries a
+-webhook until it gets a 2xx, so the same `id` can arrive more than once.
++ISO 4217 code, and refunds may carry a free-text `data.reason`. Payment
++events carry the cardholder in `data.customer`, which we pass on in the
++`payments.<status>` message. Acme retries a webhook until it gets a 2xx, so
++the same `id` can arrive more than once.
+ 
+ ### Signing
+ 
+diff --git a/src/db.ts b/src/db.ts
+index 84f8143..f16f69a 100644
+--- a/src/db.ts
++++ b/src/db.ts
+@@ -40,6 +40,16 @@ export const MIGRATIONS: string[] = [
+     created_at TEXT NOT NULL
+   )`,
+   "CREATE INDEX outbox_pending ON outbox (next_attempt_at) WHERE delivered_at IS NULL",
++  "ALTER TABLE outbox ADD COLUMN last_error TEXT",
++  `CREATE TABLE dead_letters (
++    id TEXT PRIMARY KEY,
++    outbox_id TEXT NOT NULL,
++    topic TEXT NOT NULL,
++    payload TEXT NOT NULL,
++    reason TEXT NOT NULL,
++    attempts INTEGER NOT NULL,
++    created_at TEXT NOT NULL
++  )`,
+ ];
+ 
+ export function openDb(
+diff --git a/src/routes/admin.ts b/src/routes/admin.ts
+index 4d68367..87a3308 100644
+--- a/src/routes/admin.ts
++++ b/src/routes/admin.ts
+@@ -4,9 +4,12 @@ import {
+   type DrainResult,
+   drainSchema,
+   eventByIdSchema,
++  type ListDeadLettersRoute,
+   type ListEventsRoute,
++  listDeadLettersSchema,
+   listEventsSchema,
+   paymentByIdSchema,
++  retryDeadLetterSchema,
+ } from "../schemas";
+ import type { EventService } from "../services/events";
+ 
+@@ -37,4 +40,18 @@ export function adminRoutes(
+   app.post("/admin/outbox/drain", { schema: drainSchema }, async () =>
+     deps.drain(),
+   );
++
++  // Messages that ran out of attempts, with the error that stopped them.
++  app.get<ListDeadLettersRoute>(
++    "/admin/dead-letters",
++    { schema: listDeadLettersSchema },
++    async (request) => deps.events.outbox.deadLetters(request.query.limit),
++  );
++
++  // Puts a dead letter back in the outbox once the cause is fixed.
++  app.post<ByIdRoute>(
++    "/admin/dead-letters/:id/retry",
++    { schema: retryDeadLetterSchema },
++    async (request) => deps.events.outbox.retry(request.params.id),
++  );
+ }
+diff --git a/src/schemas.ts b/src/schemas.ts
+index 9e0a4be..d5b9a0b 100644
+--- a/src/schemas.ts
++++ b/src/schemas.ts
+@@ -18,6 +18,8 @@ export type WebhookEvent = {
+     amountCents: number;
+     currency: string;
+     reason?: string;
++    /** Acme includes the cardholder on payment events. */
++    customer?: { email: string; cardLast4: string };
+   };
+ };
+ 
+@@ -58,6 +60,17 @@ export type Payment = {
+ export type IngestResult = { eventId: string; duplicate: boolean };
+ export type DrainResult = { delivered: number; failed: number };
+ 
++/** An outbox message that ran out of attempts, with the last error. */
++export type DeadLetter = {
++  id: string;
++  outboxId: string;
++  topic: string;
++  payload: unknown;
++  reason: string;
++  attempts: number;
++  createdAt: string;
++};
++
+ // Route generics, so handlers get typed params, bodies and querystrings.
+ 
+ export type WebhookRoute = { Params: { provider: string }; Body: string };
+@@ -65,6 +78,7 @@ export type ListEventsRoute = {
+   Querystring: { status?: EventStatus; limit: number };
+ };
+ export type ByIdRoute = { Params: { id: string } };
++export type ListDeadLettersRoute = { Querystring: { limit: number } };
+ 
+ // JSON schemas. Fastify validates requests and serializes responses with these.
+ 
+@@ -144,3 +158,44 @@ export const drainSchema = {
+     },
+   },
+ } as const;
++
++const deadLetterProperties = {
++  id: { type: "string" },
++  outboxId: { type: "string" },
++  topic: { type: "string" },
++  payload: { type: "object", additionalProperties: true },
++  reason: { type: "string" },
++  attempts: { type: "integer" },
++  createdAt: dateTime,
++} as const;
++
++export const listDeadLettersSchema = {
++  querystring: {
++    type: "object",
++    additionalProperties: false,
++    properties: {
++      limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
++    },
++  },
++  response: {
++    200: {
++      type: "array",
++      items: {
++        type: "object",
++        required: Object.keys(deadLetterProperties),
++        properties: deadLetterProperties,
++      },
++    },
++  },
++} as const;
++
++export const retryDeadLetterSchema = {
++  params: byIdParams,
++  response: {
++    200: {
++      type: "object",
++      required: ["outboxId"],
++      properties: { outboxId: { type: "string" } },
++    },
++  },
++} as const;
+diff --git a/src/services/events.ts b/src/services/events.ts
+index 6bb5c82..1af4241 100644
+--- a/src/services/events.ts
++++ b/src/services/events.ts
+@@ -34,7 +34,7 @@ export class EventService {
+   constructor(
+     private readonly db: DatabaseSync,
+     private readonly clock: Clock,
+-    private readonly outbox: Outbox,
++    readonly outbox: Outbox,
+   ) {}
+ 
+   private now(): string {
+@@ -160,7 +160,10 @@ export class EventService {
+             )
+             .get(provider, paymentId) as Row,
+         );
+-        this.outbox.enqueue(`payments.${payment.status}`, payment);
++        this.outbox.enqueue(`payments.${payment.status}`, {
++          ...payment,
++          customer: event.data.customer,
++        });
+ 
+         this.db
+           .prepare(
+diff --git a/src/services/outbox.ts b/src/services/outbox.ts
+index bebb3eb..323ce69 100644
+--- a/src/services/outbox.ts
++++ b/src/services/outbox.ts
+@@ -1,7 +1,9 @@
+ import { randomUUID } from "node:crypto";
+ import type { DatabaseSync } from "node:sqlite";
+ import type { FastifyBaseLogger } from "fastify";
+-import type { DrainResult } from "../schemas";
++import { transaction } from "../db";
++import { notFound } from "../lib/errors";
++import type { DeadLetter, DrainResult } from "../schemas";
+ 
+ export type Clock = () => Date;
+ 
+@@ -29,6 +31,22 @@ export class FakePublisher implements Publisher {
+ 
+ type Row = Record<string, unknown>;
+ 
++/** Failed deliveries allowed before a message is moved to `dead_letters`. */
++export const MAX_ATTEMPTS = 5;
++
++/** Seconds to wait before the next attempt, indexed by attempts so far. */
++export const BACKOFF_SECONDS = [1, 5, 30, 120, 600];
++
++const toDeadLetter = (row: Row): DeadLetter => ({
++  id: row.id as string,
++  outboxId: row.outbox_id as string,
++  topic: row.topic as string,
++  payload: JSON.parse(row.payload as string),
++  reason: row.reason as string,
++  attempts: Number(row.attempts),
++  createdAt: row.created_at as string,
++});
++
+ /**
+  * Transactional outbox: messages are written in the same transaction as the
+  * state change they describe, and `drain` delivers them afterwards, at least
+@@ -59,11 +77,11 @@ export class Outbox {
+   }
+ 
+   /**
+-   * Publishes up to `limit` due messages. Only one drain runs at a time: a
+-   * call made while another is in progress joins it and gets its result.
++   * Publishes pending messages. Only one drain runs at a time: a call made
++   * while another is in progress joins it and gets its result.
+    */
+-  drain(publisher: Publisher, limit = 50): Promise<DrainResult> {
+-    this.inflight ??= this.deliver(publisher, limit).finally(() => {
++  drain(publisher: Publisher): Promise<DrainResult> {
++    this.inflight ??= this.deliver(publisher).finally(() => {
+       this.inflight = null;
+     });
+     return this.inflight;
+@@ -74,46 +92,112 @@ export class Outbox {
+     await this.inflight?.catch(() => undefined);
+   }
+ 
+-  private async deliver(
+-    publisher: Publisher,
+-    limit: number,
+-  ): Promise<DrainResult> {
++  /** When a message that has failed `attempts` times should be tried again. */
++  private nextAttemptAt(attempts: number): string {
++    const index = Math.min(attempts, BACKOFF_SECONDS.length - 1);
++    const delay = BACKOFF_SECONDS[index] as number;
++    return new Date(this.clock().getTime() + delay * 1000).toISOString();
++  }
++
++  private async deliver(publisher: Publisher): Promise<DrainResult> {
+     const rows = this.db
+       .prepare(
+-        `SELECT id, topic, payload FROM outbox
+-         WHERE delivered_at IS NULL AND next_attempt_at <= ?
+-         ORDER BY created_at, rowid
+-         LIMIT ?`,
++        `SELECT id, topic, payload, attempts FROM outbox
++         WHERE delivered_at IS NULL
++         ORDER BY created_at, rowid`,
+       )
+-      .all(this.now(), limit) as Row[];
++      .all() as Row[];
+ 
+     const result: DrainResult = { delivered: 0, failed: 0 };
+     for (const row of rows) {
+       const id = row.id as string;
++      const attempts = Number(row.attempts);
+       try {
+         await publisher.publish(
+           row.topic as string,
+           JSON.parse(row.payload as string),
+         );
+-      } catch (error) {
++        // One update per row: the attempt, its outcome and the next slot.
+         this.db
+           .prepare(
+-            `UPDATE outbox SET attempts = attempts + 1, next_attempt_at = ?
++            `UPDATE outbox
++             SET attempts = ?, next_attempt_at = ?, delivered_at = ?,
++               last_error = NULL
+              WHERE id = ?`,
+           )
+-          .run(this.now(), id);
++          .run(attempts + 1, this.nextAttemptAt(attempts + 1), this.now(), id);
++        result.delivered++;
++      } catch (error) {
++        const reason = error instanceof Error ? error.message : String(error);
++        result.failed++;
++        if (attempts + 1 >= MAX_ATTEMPTS) {
++          this.deadLetter(row, reason, attempts + 1);
++          this.log?.error(
++            { err: error, id, topic: row.topic },
++            "outbox message dead-lettered",
++          );
++          continue;
++        }
++        this.db
++          .prepare(
++            "UPDATE outbox SET last_error = ?, next_attempt_at = ? WHERE id = ?",
++          )
++          .run(reason, this.nextAttemptAt(attempts), id);
+         this.log?.warn(
+-          { err: error, id, topic: row.topic },
++          { err: error, id, topic: row.topic, attempts },
+           "outbox delivery failed",
+         );
+-        result.failed++;
+-        continue;
+       }
+-      this.db
+-        .prepare("UPDATE outbox SET delivered_at = ? WHERE id = ?")
+-        .run(this.now(), id);
+-      result.delivered++;
+     }
+     return result;
+   }
++
++  /** Moves a message that keeps failing out of the outbox. */
++  private deadLetter(row: Row, reason: string, attempts: number): void {
++    const { id, topic, payload } = row as Record<
++      "id" | "topic" | "payload",
++      string
++    >;
++    this.db
++      .prepare(
++        `INSERT INTO dead_letters
++           (id, outbox_id, topic, payload, reason, attempts, created_at)
++         VALUES (?, ?, ?, ?, ?, ?, ?)`,
++      )
++      .run(randomUUID(), id, topic, payload, reason, attempts, this.now());
++    this.db.prepare("DELETE FROM outbox WHERE id = ?").run(id);
++  }
++
++  /** Dead letters, newest first. */
++  deadLetters(limit: number): DeadLetter[] {
++    return this.db
++      .prepare(
++        `SELECT * FROM dead_letters
++         ORDER BY created_at DESC, rowid DESC
++         LIMIT ?`,
++      )
++      .all(limit)
++      .map(toDeadLetter);
++  }
++
++  /** Puts a dead letter back in the outbox under its original id, due now. */
++  retry(id: string): { outboxId: string } {
++    const row = this.db
++      .prepare("SELECT * FROM dead_letters WHERE id = ?")
++      .get(id);
++    if (!row) throw notFound("dead letter");
++    const now = this.now();
++    transaction(this.db, () => {
++      this.db
++        .prepare(
++          `INSERT INTO outbox
++             (id, topic, payload, attempts, next_attempt_at, created_at)
++           SELECT outbox_id, topic, payload, attempts, ?, ?
++           FROM dead_letters WHERE id = ?`,
++        )
++        .run(now, now, id);
++      this.db.prepare("DELETE FROM dead_letters WHERE id = ?").run(id);
++    });
++    return { outboxId: row.outbox_id as string };
++  }
+ }
+diff --git a/test/webhooks.test.ts b/test/webhooks.test.ts
+index 0db2461..843e9f2 100644
+--- a/test/webhooks.test.ts
++++ b/test/webhooks.test.ts
+@@ -115,3 +115,61 @@ describe("acme webhooks", () => {
+     assert.equal(ctx.publisher.published.length, 2);
+   });
+ });
++
++describe("dead letters", () => {
++  let ctx: TestContext;
++
++  beforeEach(() => {
++    ctx = testApp();
++    ctx.db
++      .prepare(
++        `INSERT INTO dead_letters
++           (id, outbox_id, topic, payload, reason, attempts, created_at)
++         VALUES ('dl_1', 'out_1', 'payments.succeeded', ?, 'broker timeout',
++           5, '2026-01-15T00:00:00.000Z')`,
++      )
++      .run(JSON.stringify({ id: "pay_1", status: "succeeded" }));
++  });
++
++  afterEach(async () => {
++    await ctx.app.close();
++  });
++
++  it("lists dead letters with the reason they failed", async () => {
++    const response = await ctx.app.inject({
++      method: "GET",
++      url: "/admin/dead-letters",
++      headers: ADMIN,
++    });
++    assert.equal(response.statusCode, 200);
++    assert.deepEqual(response.json(), [
++      {
++        id: "dl_1",
++        outboxId: "out_1",
++        topic: "payments.succeeded",
++        payload: { id: "pay_1", status: "succeeded" },
++        reason: "broker timeout",
++        attempts: 5,
++        createdAt: "2026-01-15T00:00:00.000Z",
++      },
++    ]);
++  });
++
++  it("puts a retried dead letter back in the outbox", async () => {
++    const retry = await ctx.app.inject({
++      method: "POST",
++      url: "/admin/dead-letters/dl_1/retry",
++      headers: ADMIN,
++    });
++    assert.equal(retry.statusCode, 200);
++    assert.deepEqual(retry.json(), { outboxId: "out_1" });
++
++    const drained = await ctx.app.inject({
++      method: "POST",
++      url: "/admin/outbox/drain",
++      headers: ADMIN,
++    });
++    assert.deepEqual(drained.json(), { delivered: 1, failed: 0 });
++    assert.equal(ctx.publisher.published[0]?.topic, "payments.succeeded");
++  });
++});
