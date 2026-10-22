@@ -1,0 +1,25 @@
+{
+  "name": "invoice-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "dev": "NODE_OPTIONS=--no-warnings=ExperimentalWarning tsx watch src/server.ts",
+    "start": "NODE_OPTIONS=--no-warnings=ExperimentalWarning tsx src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "NODE_OPTIONS=--no-warnings=ExperimentalWarning tsx --test test/*.test.ts",
+    "lint": "biome check ."
+  },
+  "dependencies": {
+    "fastify": "^5.0.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.2",
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

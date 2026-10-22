@@ -1,0 +1,367 @@
+diff --git a/src/db.ts b/src/db.ts
+index e4c1b02..e076169 100644
+--- a/src/db.ts
++++ b/src/db.ts
+@@ -27,6 +27,9 @@ export const MIGRATIONS: string[] = [
+     position INTEGER NOT NULL
+   )`,
+   "CREATE INDEX invoice_lines_invoice_id ON invoice_lines (invoice_id, position)",
++  // One discount per invoice. discount_type is "none" when there isn't one.
++  "ALTER TABLE invoices ADD COLUMN discount_type TEXT NOT NULL",
++  "ALTER TABLE invoices ADD COLUMN discount_value INTEGER NOT NULL DEFAULT 0",
+ ];
+ 
+ export function openDb(
+diff --git a/src/repositories/invoices.ts b/src/repositories/invoices.ts
+index f296e9e..57396ad 100644
+--- a/src/repositories/invoices.ts
++++ b/src/repositories/invoices.ts
+@@ -1,12 +1,18 @@
+ import type { DatabaseSync, SQLInputValue } from "node:sqlite";
+ import { transaction } from "../db";
+ import type { Currency } from "../lib/money";
+-import type { Invoice, InvoiceStatus, Line } from "../schemas";
++import type {
++  Discount,
++  DiscountType,
++  Invoice,
++  InvoiceStatus,
++  Line,
++} from "../schemas";
+ 
+ /** An invoice as stored: everything except the derived totals. */
+ export type InvoiceRecord = Omit<
+   Invoice,
+-  "subtotalCents" | "taxCents" | "totalCents"
++  "subtotalCents" | "discount_cents" | "taxCents" | "totalCents"
+ >;
+ 
+ export type InvoiceFilter = {
+@@ -32,6 +38,20 @@ const toLine = (row: Row): Line => ({
+   taxRateBps: Number(row.tax_rate_bps),
+ });
+ 
++const toDiscount = (row: Row): Discount | null =>
++  row.discount_type === "none"
++    ? null
++    : {
++        type: row.discount_type as DiscountType,
++        value: Number(row.discount_value),
++      };
++
++/** The discount as the two columns that store it. */
++const discountColumns = (discount: Discount | null) => ({
++  discountType: discount?.type ?? "none",
++  discountValue: discount?.value ?? 0,
++});
++
+ const toRecord = (row: Row, lines: Line[]): InvoiceRecord => ({
+   id: row.id as string,
+   number: row.number as string,
+@@ -42,6 +62,7 @@ const toRecord = (row: Row, lines: Line[]): InvoiceRecord => ({
+   dueAt: row.due_at as string | null,
+   paidAt: row.paid_at as string | null,
+   lines,
++  discount: toDiscount(row),
+   createdAt: row.created_at as string,
+   updatedAt: row.updated_at as string,
+ });
+@@ -61,16 +82,17 @@ export class InvoiceRepository {
+   }
+ 
+   insert(invoice: InvoiceRecord): void {
+-    const { lines, ...row } = invoice;
++    const { lines, discount, ...row } = invoice;
+     this.db
+       .prepare(
+         `INSERT INTO invoices
+            (id, number, customer_id, status, currency, issued_at, due_at,
+-            paid_at, created_at, updated_at)
++            paid_at, discount_type, discount_value, created_at, updated_at)
+          VALUES (:id, :number, :customerId, :status, :currency, :issuedAt,
+-                 :dueAt, :paidAt, :createdAt, :updatedAt)`,
++                 :dueAt, :paidAt, :discountType, :discountValue, :createdAt,
++                 :updatedAt)`,
+       )
+-      .run(row);
++      .run({ ...row, ...discountColumns(discount) });
+     lines.forEach((line, position) => {
+       this.insertLine(invoice.id, line, position);
+     });
+@@ -143,6 +165,17 @@ export class InvoiceRepository {
+       .run({ ...update, id });
+   }
+ 
++  setDiscount(id: string, discount: Discount | null, updatedAt: string): void {
++    this.db
++      .prepare(
++        `UPDATE invoices
++         SET discount_type = :discountType, discount_value = :discountValue,
++             updated_at = :updatedAt
++         WHERE id = :id`,
++      )
++      .run({ ...discountColumns(discount), updatedAt, id });
++  }
++
+   private insertLine(invoiceId: string, line: Line, position: number): void {
+     this.db
+       .prepare(
+diff --git a/src/routes/invoices.ts b/src/routes/invoices.ts
+index 19bbc75..176faa7 100644
+--- a/src/routes/invoices.ts
++++ b/src/routes/invoices.ts
+@@ -14,6 +14,8 @@ import {
+   payInvoiceSchema,
+   type RemoveLineRoute,
+   removeLineSchema,
++  type SetDiscountRoute,
++  setDiscountSchema,
+ } from "../schemas";
+ import type { InvoiceService } from "../services/invoices";
+ 
+@@ -73,6 +75,13 @@ export function invoiceRoutes(
+     },
+   );
+ 
++  app.patch<SetDiscountRoute>(
++    "/invoices/:id/discount",
++    { schema: setDiscountSchema },
++    async (request) =>
++      service.setDiscount(request.params.id, request.body.discount),
++  );
++
+   app.post<InvoiceByIdRoute>(
+     "/invoices/:id/issue",
+     { schema: invoiceByIdSchema },
+diff --git a/src/schemas.ts b/src/schemas.ts
+index 17cad59..490afeb 100644
+--- a/src/schemas.ts
++++ b/src/schemas.ts
+@@ -5,6 +5,12 @@ import { CURRENCIES, type Currency } from "./lib/money";
+ export const INVOICE_STATUSES = ["draft", "issued", "paid", "void"] as const;
+ export type InvoiceStatus = (typeof INVOICE_STATUSES)[number];
+ 
++export const DISCOUNT_TYPES = ["percent", "fixed"] as const;
++export type DiscountType = (typeof DISCOUNT_TYPES)[number];
++
++/** A percentage (0 to 100) or a fixed amount in cents, off the whole invoice. */
++export type Discount = { type: DiscountType; value: number };
++
+ export type Line = {
+   id: string;
+   description: string;
+@@ -23,7 +29,9 @@ export type Invoice = {
+   dueAt: string | null;
+   paidAt: string | null;
+   lines: Line[];
++  discount: Discount | null;
+   subtotalCents: number;
++  discount_cents: number;
+   taxCents: number;
+   totalCents: number;
+   createdAt: string;
+@@ -63,6 +71,10 @@ export type PayInvoiceRoute = {
+   Params: InvoiceParams;
+   Body: { method: PaymentMethod };
+ };
++export type SetDiscountRoute = {
++  Params: InvoiceParams;
++  Body: { discount: Discount | null };
++};
+ 
+ // JSON schemas. Fastify validates requests and serializes responses with these.
+ 
+@@ -97,6 +109,16 @@ const lineSchema = {
+   },
+ } as const;
+ 
++const discountSchema = {
++  type: ["object", "null"],
++  additionalProperties: false,
++  required: ["type", "value"],
++  properties: {
++    type: { type: "string", enum: DISCOUNT_TYPES },
++    value: { type: "integer", minimum: 0 },
++  },
++} as const;
++
+ const invoiceProperties = {
+   id: { type: "string" },
+   number: { type: "string" },
+@@ -107,7 +129,9 @@ const invoiceProperties = {
+   dueAt: nullableDateTime,
+   paidAt: nullableDateTime,
+   lines: { type: "array", items: lineSchema },
++  discount: discountSchema,
+   subtotalCents: cents,
++  discount_cents: cents,
+   taxCents: cents,
+   totalCents: cents,
+   createdAt: dateTime,
+@@ -198,3 +222,15 @@ export const payInvoiceSchema = {
+   },
+   response: invoiceResponse,
+ } as const;
++
++/** PATCH /invoices/:id/discount. Send `{ "discount": null }` to remove it. */
++export const setDiscountSchema = {
++  params: invoiceParams,
++  body: {
++    type: "object",
++    additionalProperties: false,
++    required: ["discount"],
++    properties: { discount: discountSchema },
++  },
++  response: invoiceResponse,
++} as const;
+diff --git a/src/services/invoices.ts b/src/services/invoices.ts
+index 7a691f4..5282064 100644
+--- a/src/services/invoices.ts
++++ b/src/services/invoices.ts
+@@ -8,6 +8,7 @@ import type {
+ } from "../repositories/invoices";
+ import {
+   type CreateInvoiceBody,
++  type Discount,
+   type Invoice,
+   type InvoicePage,
+   type LineInput,
+@@ -87,6 +88,7 @@ export class InvoiceService {
+         issuedAt: null,
+         dueAt: input.dueAt ?? null,
+         paidAt: null,
++        discount: null,
+         lines: input.lines.map((line) => ({ id: randomUUID(), ...line })),
+         createdAt: now,
+         updatedAt: now,
+@@ -135,6 +137,12 @@ export class InvoiceService {
+     return this.get(id);
+   }
+ 
++  setDiscount(id: string, discount: Discount | null): Invoice {
++    console.log("discount", id, discount);
++    this.repo.setDiscount(id, discount, this.now());
++    return this.get(id);
++  }
++
+   issue(id: string): Invoice {
+     const invoice = this.get(id);
+     const now = this.clock();
+@@ -194,5 +202,5 @@ export class InvoiceService {
+ }
+ 
+ function withTotals(record: InvoiceRecord): Invoice {
+-  return { ...record, ...computeTotals(record.lines) };
++  return { ...record, ...computeTotals(record.lines, record.discount) };
+ }
+diff --git a/src/services/totals.ts b/src/services/totals.ts
+index 0318d65..c1ed531 100644
+--- a/src/services/totals.ts
++++ b/src/services/totals.ts
+@@ -1,19 +1,35 @@
+ import { BPS_DENOMINATOR, multiplyCents, sumCents } from "../lib/money";
+-import type { Line } from "../schemas";
++import type { Discount, Line } from "../schemas";
+ 
+ export type Totals = {
+   subtotalCents: number;
++  discount_cents: number;
+   taxCents: number;
+   totalCents: number;
+ };
+ 
+ type PricedLine = Pick<Line, "quantity" | "unitPriceCents" | "taxRateBps">;
+ 
++/** What a discount takes off the subtotal, in whole cents. */
++export function discountAmount(
++  subtotalCents: number,
++  discount: Discount | null,
++): number {
++  if (discount === null) return 0;
++  if (discount.type === "percent") {
++    return Math.floor(subtotalCents * (discount.value / 100));
++  }
++  return discount.value;
++}
++
+ /**
+  * Tax is rounded per line, then summed. Rounding once on the invoice total
+  * instead would disagree with the per-line figures printed on the invoice.
+  */
+-export function computeTotals(lines: readonly PricedLine[]): Totals {
++export function computeTotals(
++  lines: readonly PricedLine[],
++  discount: Discount | null = null,
++): Totals {
+   const subtotals: number[] = [];
+   const taxes: number[] = [];
+ 
+@@ -25,9 +41,11 @@ export function computeTotals(lines: readonly PricedLine[]): Totals {
+ 
+   const subtotalCents = sumCents(subtotals);
+   const taxCents = sumCents(taxes);
++  const discount_cents = discountAmount(subtotalCents, discount);
+   return {
+     subtotalCents,
++    discount_cents,
+     taxCents,
+-    totalCents: sumCents([subtotalCents, taxCents]),
++    totalCents: sumCents([subtotalCents, taxCents, -discount_cents]),
+   };
+ }
+diff --git a/test/totals.test.ts b/test/totals.test.ts
+index 82e20ff..65da54b 100644
+--- a/test/totals.test.ts
++++ b/test/totals.test.ts
+@@ -6,6 +6,7 @@ describe("computeTotals", () => {
+   it("returns zero for an invoice with no lines", () => {
+     assert.deepEqual(computeTotals([]), {
+       subtotalCents: 0,
++      discount_cents: 0,
+       taxCents: 0,
+       totalCents: 0,
+     });
+@@ -19,6 +20,7 @@ describe("computeTotals", () => {
+     ]);
+     assert.deepEqual(totals, {
+       subtotalCents: 16_000,
++      discount_cents: 0,
+       taxCents: 2_150,
+       totalCents: 18_150,
+     });
+@@ -31,8 +33,35 @@ describe("computeTotals", () => {
+     ]);
+     assert.deepEqual(totals, {
+       subtotalCents: 10,
++      discount_cents: 0,
+       taxCents: 1,
+       totalCents: 11,
+     });
+   });
++
++  it("takes a fixed discount off the invoice", () => {
++    const totals = computeTotals(
++      [{ quantity: 2, unitPriceCents: 5_000, taxRateBps: 2_000 }], // 100.00 + 20.00
++      { type: "fixed", value: 1_000 }, //                             -10.00
++    );
++    assert.deepEqual(totals, {
++      subtotalCents: 10_000,
++      discount_cents: 1_000,
++      taxCents: 2_000,
++      totalCents: 11_000,
++    });
++  });
++
++  it("takes a percentage discount off the invoice", () => {
++    const totals = computeTotals(
++      [{ quantity: 4, unitPriceCents: 2_000, taxRateBps: 2_000 }], // 80.00 + 16.00
++      { type: "percent", value: 25 }, //                              -20.00
++    );
++    assert.deepEqual(totals, {
++      subtotalCents: 8_000,
++      discount_cents: 2_000,
++      taxCents: 1_600,
++      totalCents: 7_600,
++    });
++  });
+ });

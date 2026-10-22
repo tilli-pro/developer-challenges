@@ -1,0 +1,14 @@
+{
+  "name": "soft-delete",
+  "title": "Soft-delete invoices",
+  "body": "## Motivation\n\nSupport keeps asking engineering to remove invoices from the dashboard: test invoices people create on production, and drafts raised against the wrong customer (SUP-212). Today the only way is a manual `DELETE` in the database, which loses the row for good and breaks the audit trail finance relies on. This adds a soft delete: the invoice disappears from the API but stays in the table, and can be brought back if someone deletes the wrong one.\n\n## Changes\n\n- Migration adds a nullable `deleted_at` column to `invoices` (`DEFAULT NULL`, so existing rows stay live and nothing needs backfilling).\n- `DELETE /invoices/:id` marks the invoice as deleted and returns it. Only draft and void invoices can be deleted; an issued invoice is still a live receivable and has to be voided first.\n- `POST /invoices/:id/restore` clears `deleted_at` and returns the invoice.\n- Deleted invoices are hidden: `GET /invoices` filters them out in the query, and `GET /invoices/:id` returns 404 for them.\n- `GET /invoices?includeDeleted=true` shows them again for admins; the readonly key gets a 403 for that flag. The auth hook now records the key's role on the request so routes can check it.\n- The invoice response gains `isDeleted` and `deletedAt`, so the dashboard can grey out a deleted invoice in the admin view.\n- The readonly key may now call `DELETE` as well: the support tool runs with that key and is what will do the clean-up.\n\n## Testing\n\n- Two new `app.inject` tests with the frozen clock: deleting a draft returns 200 with `isDeleted: true`, and the list hides the deleted invoice unless `includeDeleted=true` is passed.\n- Ran `pnpm dev`, deleted and restored a couple of invoices with curl and checked they dropped out of and came back into the list.\n- `pnpm typecheck`, `pnpm lint` and `pnpm test` are green.\n\n## Open questions\n\n- I let readonly keys delete because support asked, is that ok?",
+  "tags": {
+    "difficulty": "easy",
+    "focus": [
+      "api-design",
+      "data",
+      "correctness"
+    ],
+    "minutes": 45
+  }
+}

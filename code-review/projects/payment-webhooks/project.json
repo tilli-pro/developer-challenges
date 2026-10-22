@@ -1,0 +1,15 @@
+{
+  "name": "payment-webhooks",
+  "description": "Signed payment webhooks from a card processor, recorded once, applied to payments and fanned out through an outbox.",
+  "tags": {
+    "domain": "payments",
+    "minutes": 45,
+    "topics": ["http", "sqlite", "crypto", "idempotency", "queues"]
+  },
+  "walkthrough": [
+    "Processing happens inside the webhook request: src/routes/webhooks.ts calls EventService.processEvent right after ingest and only acknowledges Acme when it finishes, so a slow or failing apply turns into a slow response or a 500 and Acme retries an event we have already stored (which then comes back as a duplicate and is never reprocessed); ask how they would split intake from processing with a queue or worker and what the 2xx should promise.",
+    "EventService.processEvent (src/services/events.ts) is one switch over event types with inline SQL in every case; ask what adding a fourth type (dispute.created) or a second provider would touch, and how they would give each type its own handler.",
+    "events.payload is stored as JSON text and re-parsed in three places in src/services/events.ts (processEvent, list and get each JSON.parse it, and list and get duplicate the whole row mapping); ask what goes wrong when the payload shape changes and where a single typed boundary should sit.",
+    "The outbox worker in src/services/outbox.ts has no backoff: a failed publish increments attempts and sets next_attempt_at to now, so a poisoned message or a down broker is retried every second forever and never dead-lettered; ask for an exponential backoff with jitter, a max attempts cap and what should happen after it."
+  ]
+}
