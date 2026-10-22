@@ -1,0 +1,482 @@
+diff --git a/README.md b/README.md
+index 45f4ea9..1b5b478 100644
+--- a/README.md
++++ b/README.md
+@@ -1,13 +1,14 @@
+ # payment-webhooks
+ 
+-A small HTTP service that receives payment webhooks from our card processor,
+-Acme, and keeps a local view of each payment. Every webhook is verified,
++A small HTTP service that receives payment webhooks from our card processors,
++Acme and Bolt, and keeps a local view of each payment. Every webhook is verified,
+ recorded once, applied to the `payments` table, and announced to the rest of
+ the company as a `payments.<status>` message through a transactional outbox.
+ 
+ ```
+-Acme ──POST /webhooks/acme──▶ verify signature ──▶ events ──▶ payments
+-                                                             └──▶ outbox ──drain──▶ publisher
++Acme ──POST /webhooks/acme──┐
++Bolt ──POST /webhooks/bolt──┴──▶ verify signature ──▶ events ──▶ payments
++                                                                └──▶ outbox ──drain──▶ publisher
+ ```
+ 
+ A payment moves through `succeeded` or `failed`; refunds move a succeeded
+@@ -33,6 +34,7 @@ pnpm lint         # biome
+ | `HOST`                | `127.0.0.1`       | Bind address                            |
+ | `DB_PATH`             | `:memory:`        | SQLite file; in-memory when unset       |
+ | `ACME_WEBHOOK_SECRET` | `acme-dev-secret` | Shared secret Acme signs webhooks with  |
++| `BOLT_WEBHOOK_SECRET` | `changeme`        | Shared secret Bolt signs webhooks with  |
+ | `ADMIN_KEY`           | `admin-dev-key`   | Value of `x-admin-key` for admin routes |
+ 
+ The server drains the outbox once a second. Locally the publisher is an
+@@ -80,6 +82,18 @@ curl -s localhost:3000/webhooks/acme \
+   -d "$BODY"
+ ```
+ 
++### Bolt
++
++Bolt posts `{ "event_id", "event_type", "amount", "currency", "charge_id" }`
++with the amount as a decimal string such as `"125.00"`. `event_type` is one of
++`charge.succeeded`, `charge.failed` or `charge.refunded`, which we map to
++`payment.succeeded`, `payment.failed` and `refund.created`; `charge_id`
++becomes the payment's external id. Each request carries
++`x-bolt-signature: <base64>`, the HMAC-SHA256 of the raw request body keyed
++with `BOLT_WEBHOOK_SECRET`. Bolt does not sign a timestamp, so there is no
++tolerance window; a redelivered event is caught by the same
++`(provider, external_id)` uniqueness as Acme's.
++
+ ## API
+ 
+ Admin routes need an `x-admin-key` header. Amounts are integer cents and
+@@ -90,6 +104,7 @@ timestamps are ISO 8601 strings in UTC. Errors look like
+ | ------ | --------------------- | ------------------------------------- | ---------------------------------- |
+ | GET    | `/health`             |                                       | `{ ok: true }`                     |
+ | POST   | `/webhooks/acme`      | signed raw JSON body, see above       | 202 `{ eventId, status }`          |
++| POST   | `/webhooks/bolt`      | signed raw JSON body, see above       | 202 `{ eventId, status }`          |
+ |        |                       | an `id` we have already seen          | 200 `{ duplicate: true, eventId }` |
+ | GET    | `/admin/events`       | query: `status`, `limit` (default 50) | events, newest first               |
+ | GET    | `/admin/events/:id`   |                                       | the event, with its payload        |
+diff --git a/src/routes/webhooks.ts b/src/routes/webhooks.ts
+index be3ab65..60cd9fc 100644
+--- a/src/routes/webhooks.ts
++++ b/src/routes/webhooks.ts
+@@ -23,7 +23,10 @@ const isId = (value: unknown): value is string =>
+ /** Says why a parsed body is not a WebhookEvent, or null when it is one. */
+ export function checkWebhookEvent(body: unknown): string | null {
+   if (!isObject(body)) return "body must be a JSON object";
+-  if (!isId(body.id)) return "id must be a string of 1 to 255 characters";
++  // Optional: an event without a provider id (a Bolt refund) gets our own.
++  if (body.id !== undefined && !isId(body.id)) {
++    return "id must be a string of 1 to 255 characters";
++  }
+   if (!EVENT_TYPES.includes(body.type as EventType)) {
+     return `type must be one of ${EVENT_TYPES.join(", ")}`;
+   }
+@@ -63,7 +66,9 @@ export function webhookRoutes(
+ ): void {
+   app.post<WebhookRoute>("/webhooks/:provider", async (request, reply) => {
+     const name = request.params.provider;
+-    const provider = deps.providers.get(name);
++    // Most partners we onboard use the Acme-compatible scheme, so a name we
++    // have not registered yet is verified as Acme rather than turned away.
++    const provider = deps.providers.get(name) ?? deps.providers.get("acme");
+     if (!provider) throw notFound("provider");
+ 
+     const rawBody = request.body;
+@@ -71,7 +76,7 @@ export function webhookRoutes(
+     if (
+       typeof header !== "string" ||
+       typeof rawBody !== "string" ||
+-      !provider.verify(header, rawBody, provider.secret, deps.clock)
++      !provider.verify(header, rawBody, provider.secret(), deps.clock)
+     ) {
+       throw unauthorized("invalid signature");
+     }
+@@ -82,10 +87,12 @@ export function webhookRoutes(
+     } catch {
+       throw badRequest("body is not valid JSON");
+     }
+-    const problem = checkWebhookEvent(body);
++    const event = provider.normalize(body, deps.clock());
++    const problem = checkWebhookEvent(event);
+     if (problem) throw badRequest(problem);
+ 
+-    const ingested = deps.events.ingest(name, body as WebhookEvent);
++    // Dedupe on the normalised event, but store the body as the provider sent it.
++    const ingested = deps.events.ingest(name, event as WebhookEvent, rawBody);
+     if (ingested.duplicate) return reply.code(200).send(ingested);
+ 
+     const { eventId } = ingested;
+diff --git a/src/schemas.ts b/src/schemas.ts
+index 9e0a4be..be2aa34 100644
+--- a/src/schemas.ts
++++ b/src/schemas.ts
+@@ -9,7 +9,8 @@ export type EventType = (typeof EVENT_TYPES)[number];
+ 
+ /** The JSON body a provider posts to `/webhooks/:provider`. */
+ export type WebhookEvent = {
+-  id: string;
++  /** The provider's event id. Bolt refunds have none; ingest assigns one. */
++  id?: string;
+   type: EventType;
+   /** Unix seconds at which the provider created the event. */
+   created: number;
+@@ -21,6 +22,15 @@ export type WebhookEvent = {
+   };
+ };
+ 
++/** The JSON body Bolt posts to `/webhooks/bolt`. `amount` is a decimal string. */
++export type BoltCharge = {
++  event_id: string;
++  event_type: `charge.${"succeeded" | "failed" | "refunded"}`;
++  amount: string;
++  currency: string;
++  charge_id: string;
++};
++
+ export const EVENT_STATUSES = ["received", "processed", "failed"] as const;
+ export type EventStatus = (typeof EVENT_STATUSES)[number];
+ 
+diff --git a/src/services/events.ts b/src/services/events.ts
+index 6bb5c82..23da422 100644
+--- a/src/services/events.ts
++++ b/src/services/events.ts
+@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
+ import { transaction } from "../db";
+ import { notFound } from "../lib/errors";
+ import type {
++  BoltCharge,
+   EventStatus,
+   EventType,
+   IngestResult,
+@@ -45,8 +46,9 @@ export class EventService {
+    * Stores a verified event with status `received`. A provider retry of an
+    * event we already have is reported as a duplicate and stores nothing.
+    */
+-  ingest(provider: string, body: WebhookEvent): IngestResult {
++  ingest(provider: string, body: WebhookEvent, payload: string): IngestResult {
+     const eventId = randomUUID();
++    const externalId = body.id ?? eventId;
+     const now = this.now();
+     const { changes } = this.db
+       .prepare(
+@@ -55,12 +57,12 @@ export class EventService {
+          VALUES (?, ?, ?, ?, ?, 'received', ?)
+          ON CONFLICT (provider, external_id) DO NOTHING`,
+       )
+-      .run(eventId, provider, body.id, body.type, JSON.stringify(body), now);
++      .run(eventId, provider, externalId, body.type, payload, now);
+     if (Number(changes) === 1) return { eventId, duplicate: false };
+ 
+     const existing = this.db
+       .prepare("SELECT id FROM events WHERE provider = ? AND external_id = ?")
+-      .get(provider, body.id);
++      .get(provider, externalId);
+     return { eventId: existing?.id as string, duplicate: true };
+   }
+ 
+@@ -79,9 +81,13 @@ export class EventService {
+         if (row.status !== "received") return row.status as EventStatus;
+ 
+         const provider = row.provider as string;
++        const now = this.now();
++        if (provider === "bolt") {
++          const charge = JSON.parse(row.payload as string) as BoltCharge;
++          return this.applyBolt(eventId, charge, now);
++        }
+         const event = JSON.parse(row.payload as string) as WebhookEvent;
+         const { paymentId, amountCents, currency } = event.data;
+-        const now = this.now();
+         const upsert = {
+           id: randomUUID(),
+           provider,
+@@ -180,6 +186,96 @@ export class EventService {
+     }
+   }
+ 
++  /** Bolt's charge events, applied the same way as Acme's. */
++  private applyBolt(eventId: string, charge: BoltCharge, now: string) {
++    const paymentId = charge.charge_id;
++    const upsert = {
++      id: randomUUID(),
++      provider: "bolt",
++      paymentId,
++      amountCents: Number(charge.amount) * 100,
++      currency: charge.currency,
++      now,
++    };
++
++    switch (charge.event_type) {
++      case "charge.succeeded": {
++        this.db
++          .prepare(
++            `INSERT INTO payments (id, provider, external_id, status,
++               amount_cents, currency, updated_at)
++             VALUES (:id, :provider, :paymentId, 'succeeded',
++               :amountCents, :currency, :now)
++             ON CONFLICT (provider, external_id) DO UPDATE SET
++               status = excluded.status,
++               amount_cents = excluded.amount_cents,
++               currency = excluded.currency,
++               updated_at = excluded.updated_at`,
++          )
++          .run(upsert);
++        break;
++      }
++      case "charge.failed": {
++        this.db
++          .prepare(
++            `INSERT INTO payments (id, provider, external_id, status,
++               amount_cents, currency, updated_at)
++             VALUES (:id, :provider, :paymentId, 'failed',
++               :amountCents, :currency, :now)
++             ON CONFLICT (provider, external_id) DO UPDATE SET
++               status = excluded.status,
++               updated_at = excluded.updated_at`,
++          )
++          .run(upsert);
++        break;
++      }
++      case "charge.refunded": {
++        const payment = this.db
++          .prepare(
++            `SELECT status, amount_cents, currency, refunded_cents
++             FROM payments WHERE provider = 'bolt' AND external_id = ?`,
++          )
++          .get(paymentId);
++        if (!payment || payment.status === "failed") {
++          throw new Error(`no refundable payment ${paymentId}`);
++        }
++        if (payment.currency !== upsert.currency) {
++          throw new Error(
++            `refund in ${upsert.currency}, paid in ${payment.currency}`,
++          );
++        }
++        const refunded = Number(payment.refunded_cents) + upsert.amountCents;
++        const status: PaymentStatus =
++          refunded >= Number(payment.amount_cents)
++            ? "refunded"
++            : "partially_refunded";
++        this.db
++          .prepare(
++            `UPDATE payments
++             SET refunded_cents = ?, status = ?, updated_at = ?
++             WHERE provider = 'bolt' AND external_id = ?`,
++          )
++          .run(refunded, status, now, paymentId);
++        break;
++      }
++    }
++
++    const payment = toPayment(
++      this.db
++        .prepare(
++          "SELECT * FROM payments WHERE provider = 'bolt' AND external_id = ?",
++        )
++        .get(paymentId) as Row,
++    );
++    this.outbox.enqueue(`payments.${payment.status}`, payment);
++    this.db
++      .prepare(
++        "UPDATE events SET status = 'processed', processed_at = ? WHERE id = ?",
++      )
++      .run(now, eventId);
++    return "processed" as const;
++  }
++
+   /** Newest first, optionally filtered by status. */
+   list(filter: { status?: EventStatus | undefined; limit: number }) {
+     const rows = this.db
+diff --git a/src/services/signature.ts b/src/services/signature.ts
+index 00055d4..7db17ea 100644
+--- a/src/services/signature.ts
++++ b/src/services/signature.ts
+@@ -1,4 +1,6 @@
+ import { createHmac, timingSafeEqual } from "node:crypto";
++import { badRequest } from "../lib/errors";
++import type { BoltCharge, EventType } from "../schemas";
+ 
+ /** How far a signature's timestamp may drift from our clock, either way. */
+ export const TOLERANCE_SECONDS = 300;
+@@ -50,11 +52,57 @@ export function verifyAcmeSignature(
+   return actual.length === expected.length && timingSafeEqual(actual, expected);
+ }
+ 
+-/** Everything the webhook route needs to authenticate one provider. */
++/** HMAC-SHA256 of the raw body, base64 encoded, as Bolt sends it. */
++export function signBolt(rawBody: string, secret: string): string {
++  return createHmac("sha256", secret).update(rawBody).digest("base64");
++}
++
++/** Checks `x-bolt-signature`. Bolt signs no timestamp, so there is no window. */
++export function verifyBoltSignature(
++  header: string,
++  rawBody: string,
++  secret: string,
++): boolean {
++  return signBolt(rawBody, secret) === header.trim();
++}
++
++const BOLT_TYPES: Record<BoltCharge["event_type"], EventType> = {
++  "charge.succeeded": "payment.succeeded",
++  "charge.failed": "payment.failed",
++  "charge.refunded": "refund.created",
++};
++const BOLT_AMOUNT = /^\d+\.\d{2}$/;
++
++/** Maps a Bolt event onto ours; `created` is when we received it. */
++export function normalizeBolt(body: unknown, now: Date): unknown {
++  const charge = (body ?? {}) as Partial<BoltCharge>;
++  const type = BOLT_TYPES[charge.event_type as BoltCharge["event_type"]];
++  if (!type) throw badRequest("event_type is not a Bolt charge event");
++  if (typeof charge.amount !== "string" || !BOLT_AMOUNT.test(charge.amount)) {
++    throw badRequest("amount must be a decimal string such as 12.34");
++  }
++
++  const created = Math.floor(now.getTime() / 1000);
++  const data = {
++    paymentId: charge.charge_id,
++    amountCents: Math.round(parseFloat(charge.amount) * 100),
++    currency: charge.currency,
++  };
++  if (charge.event_type === "charge.refunded") {
++    // A refund is matched to its payment by the charge id, not by event.
++    return { type, created, data };
++  }
++  return { id: charge.event_id, type, created, data };
++}
++
++/** Everything the webhook route needs to authenticate and read one provider. */
+ export type WebhookProvider = {
+   signatureHeader: string;
+-  secret: string;
++  /** A function, so a provider can pick up a rotated secret without a restart. */
++  secret: () => string;
+   verify: typeof verifyAcmeSignature;
++  /** Maps a parsed body onto `WebhookEvent`; Acme's needs no mapping. */
++  normalize(body: unknown, now: Date): unknown;
+ };
+ 
+ /**
+@@ -64,10 +112,21 @@ export type WebhookProvider = {
+ export function loadProviders(
+   env: NodeJS.ProcessEnv = process.env,
+ ): Map<string, WebhookProvider> {
++  const acmeSecret = env.ACME_WEBHOOK_SECRET ?? "acme-dev-secret";
+   const acme: WebhookProvider = {
+     signatureHeader: "x-acme-signature",
+-    secret: env.ACME_WEBHOOK_SECRET ?? "acme-dev-secret",
++    secret: () => acmeSecret,
+     verify: verifyAcmeSignature,
++    normalize: (body) => body,
++  };
++  const bolt: WebhookProvider = {
++    signatureHeader: "x-bolt-signature",
++    secret: () => process.env.BOLT_WEBHOOK_SECRET ?? "changeme",
++    verify: verifyBoltSignature,
++    normalize: normalizeBolt,
+   };
+-  return new Map([["acme", acme]]);
++  return new Map([
++    ["acme", acme],
++    ["bolt", bolt],
++  ]);
+ }
+diff --git a/test/signature.test.ts b/test/signature.test.ts
+index d97db42..15a6d39 100644
+--- a/test/signature.test.ts
++++ b/test/signature.test.ts
+@@ -1,6 +1,10 @@
+ import assert from "node:assert/strict";
+ import { describe, it } from "node:test";
+-import { verifyAcmeSignature } from "../src/services/signature";
++import {
++  signBolt,
++  verifyAcmeSignature,
++  verifyBoltSignature,
++} from "../src/services/signature";
+ import { NOW, NOW_SECONDS, SECRET, signatureHeader } from "./helpers";
+ 
+ const body = '{"id":"evt_001","type":"payment.succeeded"}';
+@@ -46,3 +50,17 @@ describe("verifyAcmeSignature", () => {
+     }
+   });
+ });
++
++describe("verifyBoltSignature", () => {
++  it("accepts a body signed with the secret", () => {
++    assert.equal(
++      verifyBoltSignature(signBolt(body, SECRET), body, SECRET),
++      true,
++    );
++  });
++
++  it("rejects a body signed with another secret", () => {
++    const header = signBolt(body, "not-the-secret");
++    assert.equal(verifyBoltSignature(header, body, SECRET), false);
++  });
++});
+diff --git a/test/webhooks.test.ts b/test/webhooks.test.ts
+index 0db2461..17abb30 100644
+--- a/test/webhooks.test.ts
++++ b/test/webhooks.test.ts
+@@ -1,6 +1,7 @@
+ import assert from "node:assert/strict";
+ import { afterEach, beforeEach, describe, it } from "node:test";
+-import type { Payment } from "../src/schemas";
++import type { BoltCharge, Payment } from "../src/schemas";
++import { signBolt } from "../src/services/signature";
+ import {
+   ADMIN,
+   acmeEvent,
+@@ -115,3 +116,50 @@ describe("acme webhooks", () => {
+     assert.equal(ctx.publisher.published.length, 2);
+   });
+ });
++
++describe("bolt webhooks", () => {
++  let ctx: TestContext;
++
++  beforeEach(() => {
++    ctx = testApp();
++  });
++
++  afterEach(async () => {
++    await ctx.app.close();
++  });
++
++  const postBolt = (overrides: Partial<BoltCharge> = {}) => {
++    const body = JSON.stringify({
++      event_id: "bevt_001",
++      event_type: "charge.succeeded",
++      amount: "125.00",
++      currency: "USD",
++      charge_id: "ch_001",
++      ...overrides,
++    });
++    return ctx.app.inject({
++      method: "POST",
++      url: "/webhooks/bolt",
++      headers: {
++        "content-type": "application/json",
++        "x-bolt-signature": signBolt(body, "changeme"),
++      },
++      payload: body,
++    });
++  };
++
++  it("records a bolt payment for charge.succeeded", async () => {
++    assert.equal((await postBolt()).statusCode, 202);
++    const rows = ctx.db.prepare("SELECT payload FROM outbox").all();
++    const queued = JSON.parse(rows[0]?.payload as string) as Payment;
++    assert.equal(queued.provider, "bolt");
++    assert.equal(queued.amountCents, 12_500);
++  });
++
++  it("acknowledges a redelivered charge without applying it twice", async () => {
++    await postBolt();
++    const again = await postBolt();
++    assert.equal(again.statusCode, 200);
++    assert.equal(count(ctx, "outbox"), 1);
++  });
++});
