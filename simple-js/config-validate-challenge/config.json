@@ -1,0 +1,6 @@
+{
+  "server": { "port": 3000, "host": "localhost" },
+  "database": { "url": "postgres://localhost/app" },
+  "features": ["auth"],
+  "log": { "level": "info" }
+}

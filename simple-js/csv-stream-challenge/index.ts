@@ -1,5 +1,5 @@
+import { join } from "node:path";
 import type { Arg, Tags } from "../types";
-import { sampleFilePath } from "./init";
 
 export const main = async (
   filePath: string | undefined,
@@ -24,7 +24,7 @@ export const args: Arg[] = [
     arg: "[file]",
     description:
       "Path to a CSV file. Defaults to the sample.csv bundled with the challenge.",
-    defaultValue: () => sampleFilePath,
+    defaultValue: () => join(import.meta.dirname, "sample.csv"),
   },
   {
     type: "flag",

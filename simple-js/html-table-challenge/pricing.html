@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Pricing - Example</title>
+  </head>
+  <body>
+    <nav>
+      <a href="/">Home</a>
+      <a href="/docs">Docs</a>
+      <a href="/pricing/" aria-current="page">Pricing</a>
+    </nav>
+
+    <main>
+      <h1>Plans</h1>
+      <p>Pick the plan that fits. Prices are in USD, billed monthly.</p>
+
+      <table class="plans">
+        <thead>
+          <tr>
+            <th>Plan</th>
+            <th>Price</th>
+            <th>Storage</th>
+            <th>Link</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Free</td>
+            <td><span class="amount">$0</span>
+              /mo</td>
+            <td>1 GB</td>
+            <td><a href="/signup?plan=free">Start</a></td>
+          </tr>
+          <tr>
+            <td><strong>Pro</strong> <span class="badge">Popular</span></td>
+            <td><span class="amount">$12</span>
+              /mo</td>
+            <td>100   GB</td>
+            <td><a href="/signup?plan=pro">Start</a></td>
+          </tr>
+          <tr>
+            <td>Team</td>
+            <td><span class="amount">$49</span>
+              /mo</td>
+            <td>1 TB</td>
+            <td><a href="signup?plan=team">Start</a></td>
+          </tr>
+          <tr>
+            <td>Enterprise</td>
+            <td>Custom</td>
+            <td>Unlimited</td>
+            <td><a href="../contact">Talk to sales</a></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>Compare limits</h2>
+      <table class="limits">
+        <thead>
+          <tr><th>Feature</th><th>Free</th><th>Pro</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Seats</td><td>1</td><td>10</td></tr>
+          <tr><td>API calls / day</td><td>1,000</td><td>100,000</td></tr>
+        </tbody>
+      </table>
+    </main>
+
+    <footer>
+      <a href="https://status.example.com">Status</a>
+    </footer>
+  </body>
+</html>

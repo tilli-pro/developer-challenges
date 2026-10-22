@@ -2,12 +2,26 @@
   "type": "module",
   "dependencies": {
     "@biomejs/biome": "^2.5.15",
+    "@types/luxon": "^3.7.6",
     "@types/node": "^26.6.5",
+    "@types/qrcode": "^1.5.6",
+    "cheerio": "^1.2.0",
     "commander": "^15.0.0",
+    "date-fns": "^4.4.0",
+    "diff": "^9.0.0",
     "en-dictionary": "^2.0.3",
     "en-wordnet": "^2.0.11",
+    "fast-glob": "^3.3.3",
+    "jose": "^6.2.12",
+    "luxon": "^3.7.2",
+    "marked": "^18.1.1",
+    "pino": "^10.4.0",
+    "qrcode": "^1.5.4",
+    "rrule": "^2.8.1",
     "tsx": "^4.23.15",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "undici": "^8.12.2",
+    "zod": "^4.6.7"
   },
   "scripts": {
     "sj": "tsx .",
