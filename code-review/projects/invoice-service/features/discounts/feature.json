@@ -1,0 +1,14 @@
+{
+  "name": "discounts",
+  "title": "Add percentage and fixed discounts to invoices",
+  "body": "## Motivation\n\nSales has been giving customers discounts by hand: the line schema rejects negative prices, so today they issue the full invoice and then fix the total in the accounting export. Finance asked (BILL-212) for a proper discount on the invoice itself, either a percentage or a fixed amount, taken off the subtotal before tax so the tax we charge is on what the customer actually pays.\n\n## Changes\n\n- New `discount` field on invoices: `{ \"type\": \"percent\" | \"fixed\", \"value\": number }` or `null`. A `percent` value is a whole percentage (0 to 100); a `fixed` value is in cents, like every other amount.\n- `PATCH /invoices/:id/discount` with `{ \"discount\": { ... } }` sets or replaces it; `{ \"discount\": null }` removes it.\n- Migration adds `discount_type` and `discount_value` to `invoices`. New invoices start with no discount.\n- `computeTotals` takes the discount, and the invoice response gains `discount_cents` next to the subtotal. Totals are still derived on read, never stored.\n- The repository reads and writes the two new columns.\n\n## Testing\n\n- Updated the existing `computeTotals` tests for the new field and added cases for a fixed and a percentage discount.\n- Ran `pnpm dev` and tried the endpoint with curl: set, replace and clear a discount; an unknown `type` gets a 400 and the readonly key gets a 403.\n- `pnpm typecheck`, `pnpm lint` and `pnpm test` are green.\n\n## Open questions\n\n- Should discounts apply before or after tax? I went with after since that matched the invoice totals test.\n- I haven't touched the README's API table yet; happy to add the new route there once the shape is agreed.",
+  "tags": {
+    "difficulty": "medium",
+    "focus": [
+      "correctness",
+      "data",
+      "tests"
+    ],
+    "minutes": 45
+  }
+}
