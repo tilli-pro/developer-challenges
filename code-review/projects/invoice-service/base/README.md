@@ -53,8 +53,10 @@ strings in UTC.
 | POST   | `/invoices/:id/pay`           | `{ method: "card" \| "bank" }`                          | the invoice, now `paid`    |
 | POST   | `/invoices/:id/void`          |                                                         | the invoice, now `void`    |
 
-`currency` is one of `USD`, `EUR`, `GBP`. Issuing sets `issuedAt` and, if the
-invoice has no `dueAt` yet, a due date 30 days later. The list is newest first;
+`currency` is one of `USD`, `EUR`, `GBP`, and an invoice holds at most 50 lines
+(quantity up to 10,000, unit price up to 10,000,000 cents). Issuing sets
+`issuedAt` and, if the invoice has no `dueAt` yet, a due date 30 days later.
+The list is newest first;
 pass `nextCursor` back as `cursor` to fetch the next page (`limit` defaults to
 20, maximum 100).
 

@@ -1,18 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { HttpError, notFound } from "../lib/errors";
+import { conflict, HttpError, notFound } from "../lib/errors";
 import type { Currency } from "../lib/money";
 import type {
   InvoiceFilter,
   InvoiceRecord,
   InvoiceRepository,
 } from "../repositories/invoices";
-import type {
-  CreateInvoiceBody,
-  Invoice,
-  InvoicePage,
-  LineInput,
-  ListInvoicesQuery,
-  PaymentMethod,
+import {
+  type CreateInvoiceBody,
+  type Invoice,
+  type InvoicePage,
+  type LineInput,
+  type ListInvoicesQuery,
+  MAX_LINES,
+  type PaymentMethod,
 } from "../schemas";
 import { computeTotals } from "./totals";
 
@@ -117,6 +118,9 @@ export class InvoiceService {
   }
 
   addLine(id: string, input: LineInput): Invoice {
+    if (this.get(id).lines.length >= MAX_LINES) {
+      throw conflict(`an invoice can have at most ${MAX_LINES} lines`);
+    }
     this.repo.transaction(() => {
       this.repo.addLine(id, { id: randomUUID(), ...input }, this.now());
     });

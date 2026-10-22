@@ -73,6 +73,27 @@ describe("invoices API", () => {
     assert.equal(response.json().error.code, "conflict");
   });
 
+  it("rejects a 51st line", async () => {
+    const line = {
+      description: "Hosting",
+      quantity: 1,
+      unitPriceCents: 2_000,
+      taxRateBps: 0,
+    };
+    const created = await createInvoice(
+      app,
+      sampleInvoice({ lines: Array.from({ length: 50 }, () => line) }),
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/invoices/${created.id}/lines`,
+      headers: ADMIN,
+      payload: line,
+    });
+    assert.equal(response.statusCode, 409);
+  });
+
   it("rejects writes made with the readonly key", async () => {
     const response = await app.inject({
       method: "POST",

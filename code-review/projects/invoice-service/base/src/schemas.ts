@@ -71,14 +71,19 @@ const nonEmpty = { type: "string", minLength: 1 } as const;
 const dateTime = { type: "string", format: "date-time" } as const;
 const nullableDateTime = { ...dateTime, type: ["string", "null"] } as const;
 
+// Bounds keep every intermediate a safe integer: a line is at most 1e11 cents,
+// its subtotal * taxRateBps at most 1e15, and an invoice of MAX_LINES at most
+// 1e13 including tax.
+export const MAX_LINES = 50;
+
 const lineInputSchema = {
   type: "object",
   additionalProperties: false,
   required: ["description", "quantity", "unitPriceCents", "taxRateBps"],
   properties: {
     description: { type: "string", minLength: 1, maxLength: 500 },
-    quantity: { type: "integer", minimum: 1, maximum: 1_000_000 },
-    unitPriceCents: { type: "integer", minimum: 0, maximum: 100_000_000 },
+    quantity: { type: "integer", minimum: 1, maximum: 10_000 },
+    unitPriceCents: { type: "integer", minimum: 0, maximum: 10_000_000 },
     taxRateBps: { type: "integer", minimum: 0, maximum: 10_000 },
   },
 } as const;
@@ -133,7 +138,7 @@ export const createInvoiceSchema = {
       customerId: { type: "string", minLength: 1, maxLength: 100 },
       currency: { type: "string", enum: CURRENCIES },
       dueAt: dateTime,
-      lines: { type: "array", maxItems: 100, items: lineInputSchema },
+      lines: { type: "array", maxItems: MAX_LINES, items: lineInputSchema },
     },
   },
   response: { 201: invoiceSchema },
