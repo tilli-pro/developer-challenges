@@ -1,0 +1,13 @@
+{
+  "name": "payment-reminders",
+  "title": "Send overdue payment reminders",
+  "body": "## Motivation\n\nFinance chases late payers by hand: every morning someone filters issued invoices in the dashboard and emails each customer (FIN-104). They asked for an automatic reminder once an invoice is more than 3 days past its due date, the grace period they already give customers who pay a little late, and one reminder per invoice for now.\n\n## Changes\n\n- Migration adds a nullable `reminder_sent_at` column to `invoices`; NULL means no reminder has gone out.\n- `Mailer` and `CustomerDirectory` interfaces in `services/invoices.ts`, next to `PaymentProvider`, each with an in-process fake (`FakeMailer` keeps what it sent; `FakeCustomerDirectory` knows one contact and falls back to `<customerId>@example.com`). Both are `buildApp` options, so tests and, later, the real SMTP and CRM clients plug in without touching the service.\n- `POST /invoices/reminders/run` finds issued invoices whose grace period after the due date is over and that have not had a reminder, emails the customer's billing contact with the number, amount and due date, records `reminder_sent_at`, and returns `{ scanned, sent, failed }`. A send that fails is counted in `failed` and the run carries on with the next invoice, so one bad address does not block everyone else.\n- The route is a POST behind the API key hook, so only the admin key can trigger a run. The scheduler will call it once a day.\n- Repository: `findOverdueUnreminded(today)` and `markReminded(id, at)`.\n\n## Testing\n\n- New `app.inject` test with the frozen clock: one overdue issued invoice and one draft, and the run sends exactly one reminder.\n- Ran `pnpm dev`, created a few back-dated invoices, triggered the run with curl and checked the summary; a readonly key gets a 403.\n- `pnpm typecheck`, `pnpm lint` and `pnpm test` are green.\n\n## Open questions\n\n- Should we run this from a cron inside the service or keep it as an endpoint? I kept the endpoint so ops can also trigger it by hand, but a timer in `server.ts` would save us setting up the scheduler job.",
+  "tags": {
+    "difficulty": "medium",
+    "focus": [
+      "concurrency",
+      "error-handling"
+    ],
+    "minutes": 45
+  }
+}
