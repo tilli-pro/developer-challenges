@@ -1,0 +1,10 @@
+{
+  "name": "csv-export",
+  "title": "Export invoices as CSV",
+  "body": "## Motivation\n\nFinance reconciles invoices in a spreadsheet at month end and today copies them out of `GET /invoices` page by page (FIN-88). They asked for a CSV they can download, and the finance dashboard wants to pull the same file on a schedule.\n\n## Changes\n\n- `GET /invoices/export.csv` returns one row per invoice: number, customerId, status, currency, issuedAt, dueAt, totalCents, lineCount. It takes the same `customerId` and `status` filters as the list, without paging.\n- `listForExport` on the repository and the service loads the matching invoices with their lines; totals still come from `computeTotals`, like every other read.\n- New `src/lib/csv.ts` with pure `formatRow` / `toCsvRows` helpers, so the formatting is tested without going through HTTP.\n- The route streams the rows straight to the response through `reply.raw`, so a big export is not buffered by Fastify's serializer. It is registered in `app.ts` next to `/health`, so the dashboard's scheduled job can pick it up.\n- README: a row in the API table and a short section on the export format.\n\n## Testing\n\n- Unit tests for `toCsvRows`: header plus one row per invoice, and the empty case.\n- An `app.inject` test that exports with a customer and status filter and checks the exact CSV.\n- Ran `pnpm dev`, downloaded an export with curl and opened it in a spreadsheet; columns line up.\n- `pnpm typecheck`, `pnpm lint` and `pnpm test` are green.\n\n## Open questions\n\n- I kept it simple with a string join, happy to stream if we think exports get big.",
+  "tags": {
+    "difficulty": "medium",
+    "focus": ["security", "performance", "api-design"],
+    "minutes": 45
+  }
+}

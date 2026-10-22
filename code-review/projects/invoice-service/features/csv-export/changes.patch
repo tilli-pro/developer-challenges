@@ -1,0 +1,294 @@
+diff --git a/README.md b/README.md
+index a2e8d2f..cf9ebb2 100644
+--- a/README.md
++++ b/README.md
+@@ -46,6 +46,7 @@ strings in UTC.
+ | GET    | `/health`                     |                                                         | `{ ok: true }`             |
+ | POST   | `/invoices`                   | `{ customerId, currency, dueAt?, lines }`               | 201, the new draft invoice |
+ | GET    | `/invoices`                   | query: `customerId`, `status`, `limit`, `cursor`        | `{ items, nextCursor }`    |
++| GET    | `/invoices/export.csv`        | query: `customerId`, `status`                           | CSV, one row per invoice   |
+ | GET    | `/invoices/:id`               |                                                         | the invoice                |
+ | POST   | `/invoices/:id/lines`         | `{ description, quantity, unitPriceCents, taxRateBps }` | the invoice (draft only)   |
+ | DELETE | `/invoices/:id/lines/:lineId` |                                                         | the invoice (draft only)   |
+@@ -89,6 +90,20 @@ An invoice looks like this:
+ }
+ ```
+ 
++### CSV export
++
++`GET /invoices/export.csv` returns every invoice matching the filters, oldest
++first, with no paging. It takes the same `customerId` and `status` filters as
++the list. The first row is the header:
++
++```
++number,customerId,status,currency,issuedAt,dueAt,totalCents,lineCount
++INV-000001,cus_acme,issued,USD,1/15/2026,2026-02-14T00:00:00.000Z,180000,1
++```
++
++Rows are written straight to the response as they are produced, so large
++exports do not have to be buffered by the service.
++
+ ### Try it
+ 
+ ```sh
+@@ -104,6 +119,9 @@ curl -s -X POST localhost:3000/invoices/<id>/pay \
+ 
+ curl -s 'localhost:3000/invoices?customerId=cus_acme&limit=10' \
+   -H 'x-api-key: readonly-dev-key'
++
++curl -s 'localhost:3000/invoices/export.csv?status=paid' \
++  -H 'x-api-key: readonly-dev-key' > invoices.csv
+ ```
+ 
+ ## Design notes
+diff --git a/src/app.ts b/src/app.ts
+index d1433a3..2ffa9f1 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -4,7 +4,7 @@ import { apiKeyAuth } from "./auth";
+ import { openDb } from "./db";
+ import { errorHandler, notFoundHandler } from "./lib/errors";
+ import { InvoiceRepository } from "./repositories/invoices";
+-import { invoiceRoutes } from "./routes/invoices";
++import { exportRoutes, invoiceRoutes } from "./routes/invoices";
+ import {
+   type Clock,
+   FakePaymentProvider,
+@@ -34,6 +34,8 @@ export function buildApp(options: AppOptions = {}): FastifyInstance {
+   app.setNotFoundHandler(notFoundHandler);
+ 
+   app.get("/health", async () => ({ ok: true }));
++  // Polled on a schedule by the finance dashboard, like /health by monitoring.
++  exportRoutes(app, service);
+ 
+   // Everything registered in this scope sits behind the API key check.
+   app.register(async (api) => {
+diff --git a/src/lib/csv.ts b/src/lib/csv.ts
+new file mode 100644
+index 0000000..51f2d81
+--- /dev/null
++++ b/src/lib/csv.ts
+@@ -0,0 +1,37 @@
++import type { Invoice } from "../schemas";
++
++/** Columns of the invoice export, in order. */
++export const CSV_COLUMNS = [
++  "number",
++  "customerId",
++  "status",
++  "currency",
++  "issuedAt",
++  "dueAt",
++  "totalCents",
++  "lineCount",
++] as const;
++
++/** One invoice as a CSV line, in `CSV_COLUMNS` order. */
++export function formatRow(invoice: Invoice): string {
++  const fields = [
++    invoice.number,
++    invoice.customerId,
++    invoice.status,
++    invoice.currency,
++    invoice.issuedAt ? new Date(invoice.issuedAt).toLocaleDateString() : "",
++    invoice.dueAt ?? "",
++    String(invoice.totalCents),
++    String(invoice.lines.length),
++  ];
++  return fields.join(",");
++}
++
++/**
++ * The header line followed by one line per invoice. No I/O here, so the route
++ * decides how the lines are written out.
++ */
++export function toCsvRows(invoices: readonly Invoice[]): string[] {
++  if (invoices.length === 0) return [];
++  return [CSV_COLUMNS.join(","), ...invoices.map(formatRow)];
++}
+diff --git a/src/repositories/invoices.ts b/src/repositories/invoices.ts
+index f296e9e..aad9a46 100644
+--- a/src/repositories/invoices.ts
++++ b/src/repositories/invoices.ts
+@@ -17,6 +17,9 @@ export type InvoiceFilter = {
+   limit: number;
+ };
+ 
++/** The list filters without paging: an export returns every match. */
++export type ExportFilter = Pick<InvoiceFilter, "customerId" | "status">;
++
+ export type StatusUpdate = Pick<
+   InvoiceRecord,
+   "status" | "issuedAt" | "dueAt" | "paidAt" | "updatedAt"
+@@ -112,6 +115,25 @@ export class InvoiceRepository {
+     return rows.map((row) => toRecord(row, lines.get(row.id as string) ?? []));
+   }
+ 
++  /** Every invoice matching the filter, oldest first, with its lines. */
++  listForExport(filter: ExportFilter): InvoiceRecord[] {
++    const where: string[] = [];
++    if (filter.customerId) {
++      where.push(`customer_id = '${filter.customerId}'`);
++    }
++    if (filter.status) {
++      where.push(`status = '${filter.status}'`);
++    }
++
++    const sql = `SELECT * FROM invoices
++      ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
++      ORDER BY created_at, id`;
++    const rows = this.db.prepare(sql).all();
++
++    const lines = this.linesFor(rows.map((row) => row.id as string));
++    return rows.map((row) => toRecord(row, lines.get(row.id as string) ?? []));
++  }
++
+   addLine(invoiceId: string, line: Line, updatedAt: string): void {
+     const row = this.db
+       .prepare(
+diff --git a/src/routes/invoices.ts b/src/routes/invoices.ts
+index 19bbc75..a5a7d60 100644
+--- a/src/routes/invoices.ts
++++ b/src/routes/invoices.ts
+@@ -1,4 +1,5 @@
+ import type { FastifyInstance } from "fastify";
++import { toCsvRows } from "../lib/csv";
+ import { conflict } from "../lib/errors";
+ import {
+   type AddLineRoute,
+@@ -8,6 +9,7 @@ import {
+   type InvoiceByIdRoute,
+   type InvoiceStatus,
+   invoiceByIdSchema,
++  type ListInvoicesQuery,
+   type ListInvoicesRoute,
+   listInvoicesSchema,
+   type PayInvoiceRoute,
+@@ -17,6 +19,36 @@ import {
+ } from "../schemas";
+ import type { InvoiceService } from "../services/invoices";
+ 
++/** Same filters as GET /invoices, without paging. */
++type ExportInvoicesRoute = {
++  Querystring: Pick<ListInvoicesQuery, "customerId" | "status">;
++};
++
++/**
++ * GET /invoices/export.csv: one row per invoice matching the filters. Kept
++ * out of `invoiceRoutes` because app.ts registers it next to /health, where
++ * the finance dashboard's scheduled pull picks it up.
++ */
++export function exportRoutes(
++  app: FastifyInstance,
++  service: InvoiceService,
++): void {
++  app.get<ExportInvoicesRoute>(
++    "/invoices/export.csv",
++    async (request, reply) => {
++      reply.hijack();
++      // Send the headers straight away so the download starts while we query.
++      reply.raw.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
++      try {
++        const rows = toCsvRows(service.listForExport(request.query));
++        reply.raw.write(rows.join("\n"));
++      } finally {
++        reply.raw.end();
++      }
++    },
++  );
++}
++
+ export function invoiceRoutes(
+   app: FastifyInstance,
+   service: InvoiceService,
+diff --git a/src/services/invoices.ts b/src/services/invoices.ts
+index 7a691f4..c35c4de 100644
+--- a/src/services/invoices.ts
++++ b/src/services/invoices.ts
+@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
+ import { conflict, HttpError, notFound } from "../lib/errors";
+ import type { Currency } from "../lib/money";
+ import type {
++  ExportFilter,
+   InvoiceFilter,
+   InvoiceRecord,
+   InvoiceRepository,
+@@ -117,6 +118,11 @@ export class InvoiceService {
+     return { items, nextCursor };
+   }
+ 
++  /** Every invoice matching the filter, with totals, for the CSV export. */
++  listForExport(filter: ExportFilter): Invoice[] {
++    return this.repo.listForExport(filter).map(withTotals);
++  }
++
+   addLine(id: string, input: LineInput): Invoice {
+     if (this.get(id).lines.length >= MAX_LINES) {
+       throw conflict(`an invoice can have at most ${MAX_LINES} lines`);
+diff --git a/test/invoices.test.ts b/test/invoices.test.ts
+index 3a8c357..d98f325 100644
+--- a/test/invoices.test.ts
++++ b/test/invoices.test.ts
+@@ -1,6 +1,7 @@
+ import assert from "node:assert/strict";
+ import { afterEach, beforeEach, describe, it } from "node:test";
+ import type { FastifyInstance } from "fastify";
++import { toCsvRows } from "../src/lib/csv";
+ import type { Invoice, InvoicePage } from "../src/schemas";
+ import {
+   ADMIN,
+@@ -136,4 +137,54 @@ describe("invoices API", () => {
+     const seen = new Set([...page.items, ...rest.items].map((i) => i.id));
+     assert.equal(seen.size, 3);
+   });
++
++  it("exports matching invoices as CSV", async () => {
++    await createInvoice(app);
++    await createInvoice(app, sampleInvoice({ customerId: "cus_globex" }));
++
++    const response = await app.inject({
++      method: "GET",
++      url: "/invoices/export.csv?customerId=cus_acme&status=draft",
++      headers: READONLY,
++    });
++    assert.equal(response.statusCode, 200);
++    assert.deepEqual(response.body.split("\n"), [
++      "number,customerId,status,currency,issuedAt,dueAt,totalCents,lineCount",
++      "INV-000001,cus_acme,draft,USD,,,180000,1",
++    ]);
++  });
++});
++
++describe("toCsvRows", () => {
++  const invoice: Invoice = {
++    id: "inv_1",
++    number: "INV-000042",
++    customerId: "cus_initech",
++    status: "draft",
++    currency: "EUR",
++    issuedAt: null,
++    dueAt: "2026-02-14T00:00:00.000Z",
++    paidAt: null,
++    lines: [],
++    subtotalCents: 0,
++    taxCents: 0,
++    totalCents: 0,
++    createdAt: "2026-01-15T00:00:00.000Z",
++    updatedAt: "2026-01-15T00:00:00.000Z",
++  };
++
++  it("writes a header row and one row per invoice", () => {
++    assert.deepEqual(
++      toCsvRows([invoice, { ...invoice, number: "INV-000043" }]),
++      [
++        "number,customerId,status,currency,issuedAt,dueAt,totalCents,lineCount",
++        "INV-000042,cus_initech,draft,EUR,,2026-02-14T00:00:00.000Z,0,0",
++        "INV-000043,cus_initech,draft,EUR,,2026-02-14T00:00:00.000Z,0,0",
++      ],
++    );
++  });
++
++  it("returns nothing when there are no invoices", () => {
++    assert.deepEqual(toCsvRows([]), []);
++  });
+ });
