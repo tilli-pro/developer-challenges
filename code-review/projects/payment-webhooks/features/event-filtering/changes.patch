@@ -1,0 +1,336 @@
+diff --git a/README.md b/README.md
+index 45f4ea9..ed94343 100644
+--- a/README.md
++++ b/README.md
+@@ -96,6 +96,13 @@ timestamps are ISO 8601 strings in UTC. Errors look like
+ | GET    | `/admin/payments/:id` | our payment id, as in outbox messages | the payment                        |
+ | POST   | `/admin/outbox/drain` | delivers due messages now             | `{ delivered, failed }`            |
+ 
++`GET /admin/events` can also be narrowed by `type`, `provider` and a `from` /
++`to` range on the time we received the event, for example
++`/admin/events?provider=acme&type=refund.created&from=2026-01-01`. Results come
++a page at a time: pass the `nextCursor` of one page as `cursor` to get the
++next. `orderBy` takes a column and direction and defaults to
++`received_at DESC`.
++
+ An event's `status` is `received`, `processed` or `failed`; a failed event
+ keeps the error in `error`. A payment looks like this:
+ 
+diff --git a/src/db.ts b/src/db.ts
+index 84f8143..b1461af 100644
+--- a/src/db.ts
++++ b/src/db.ts
+@@ -40,6 +40,8 @@ export const MIGRATIONS: string[] = [
+     created_at TEXT NOT NULL
+   )`,
+   "CREATE INDEX outbox_pending ON outbox (next_attempt_at) WHERE delivered_at IS NULL",
++  // Backs the provider/type filters on GET /admin/events.
++  "CREATE INDEX events_provider_type ON events (provider, type)",
+ ];
+ 
+ export function openDb(
+diff --git a/src/routes/admin.ts b/src/routes/admin.ts
+index 4d68367..344ac17 100644
+--- a/src/routes/admin.ts
++++ b/src/routes/admin.ts
+@@ -1,4 +1,5 @@
+ import type { FastifyInstance } from "fastify";
++import { HttpError } from "../lib/errors";
+ import {
+   type ByIdRoute,
+   type DrainResult,
+@@ -8,7 +9,7 @@ import {
+   listEventsSchema,
+   paymentByIdSchema,
+ } from "../schemas";
+-import type { EventService } from "../services/events";
++import { decodeCursor, type EventService } from "../services/events";
+ 
+ /** Operator routes for inspecting events and payments. */
+ export function adminRoutes(
+@@ -18,7 +19,10 @@ export function adminRoutes(
+   app.get<ListEventsRoute>(
+     "/admin/events",
+     { schema: listEventsSchema },
+-    async (request) => deps.events.list(request.query),
++    async (request) => {
++      const { cursor, ...filter } = request.query;
++      return deps.events.list(filter, cursor ? decodeCursor(cursor) : 0);
++    },
+   );
+ 
+   app.get<ByIdRoute>(
+diff --git a/src/schemas.ts b/src/schemas.ts
+index 9e0a4be..d981248 100644
+--- a/src/schemas.ts
++++ b/src/schemas.ts
+@@ -24,6 +24,10 @@ export type WebhookEvent = {
+ export const EVENT_STATUSES = ["received", "processed", "failed"] as const;
+ export type EventStatus = (typeof EVENT_STATUSES)[number];
+ 
++/** Providers we accept webhooks from; matches `loadProviders`. */
++export const PROVIDERS = ["acme"] as const;
++export type Provider = (typeof PROVIDERS)[number];
++
+ export type StoredEvent = {
+   id: string;
+   provider: string;
+@@ -61,9 +65,18 @@ export type DrainResult = { delivered: number; failed: number };
+ // Route generics, so handlers get typed params, bodies and querystrings.
+ 
+ export type WebhookRoute = { Params: { provider: string }; Body: string };
+-export type ListEventsRoute = {
+-  Querystring: { status?: EventStatus; limit: number };
++export type EventFilter = {
++  status?: EventStatus;
++  type?: EventType;
++  provider?: Provider;
++  from?: string;
++  to?: string;
++  limit: number;
++  cursor?: string;
++  orderBy: string;
+ };
++export type ListEventsRoute = { Querystring: EventFilter };
++export type EventPage = { items: StoredEvent[]; nextCursor: string | null };
+ export type ByIdRoute = { Params: { id: string } };
+ 
+ // JSON schemas. Fastify validates requests and serializes responses with these.
+@@ -119,10 +132,37 @@ export const listEventsSchema = {
+     additionalProperties: false,
+     properties: {
+       status: { type: "string", enum: EVENT_STATUSES },
+-      limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
++      type: { type: "string", enum: EVENT_TYPES },
++      provider: { type: "string", enum: PROVIDERS },
++      from: { type: "string", description: "Start of the received_at range" },
++      to: { type: "string", description: "End of the received_at range" },
++      limit: {
++        type: "integer",
++        minimum: 1,
++        default: 50,
++        description: "Page size",
++      },
++      cursor: {
++        type: "string",
++        description: "The nextCursor from the previous page",
++      },
++      orderBy: {
++        type: "string",
++        default: "received_at DESC",
++        description: "Column and direction, newest first by default",
++      },
++    },
++  },
++  response: {
++    200: {
++      type: "object",
++      required: ["items", "nextCursor"],
++      properties: {
++        items: { type: "array", items: eventSchema },
++        nextCursor: { type: ["string", "null"] },
++      },
+     },
+   },
+-  response: { 200: { type: "array", items: eventSchema } },
+ } as const;
+ 
+ export const eventByIdSchema = {
+diff --git a/src/services/events.ts b/src/services/events.ts
+index 6bb5c82..bbe6c22 100644
+--- a/src/services/events.ts
++++ b/src/services/events.ts
+@@ -1,8 +1,10 @@
+ import { randomUUID } from "node:crypto";
+ import type { DatabaseSync } from "node:sqlite";
+ import { transaction } from "../db";
+-import { notFound } from "../lib/errors";
++import { badRequest, notFound } from "../lib/errors";
+ import type {
++  EventFilter,
++  EventPage,
+   EventStatus,
+   EventType,
+   IngestResult,
+@@ -15,6 +17,18 @@ import type { Clock, Outbox } from "./outbox";
+ 
+ type Row = Record<string, unknown>;
+ 
++/** Cursors are opaque to clients: base64url of the offset of the next page. */
++export const encodeCursor = (offset: number): string =>
++  Buffer.from(String(offset)).toString("base64url");
++
++export function decodeCursor(cursor: string): number {
++  const offset = Number(Buffer.from(cursor, "base64url").toString("utf8"));
++  if (!Number.isSafeInteger(offset) || offset < 0) {
++    throw badRequest("invalid cursor");
++  }
++  return offset;
++}
++
+ const toPayment = (row: Row): Payment => ({
+   id: row.id as string,
+   provider: row.provider as string,
+@@ -180,18 +194,49 @@ export class EventService {
+     }
+   }
+ 
+-  /** Newest first, optionally filtered by status. */
+-  list(filter: { status?: EventStatus | undefined; limit: number }) {
++  /**
++   * One page of events matching the filter, in `orderBy` order. `nextCursor`
++   * is null on the last page; otherwise pass it back as `cursor`.
++   */
++  list(filter: Omit<EventFilter, "cursor">, offset = 0): EventPage {
++    const where: string[] = [];
++    const params: Record<string, string | number> = {
++      limit: filter.limit + 1,
++      offset,
++    };
++    if (filter.status) {
++      where.push("status = :status");
++      params.status = filter.status;
++    }
++    if (filter.provider) {
++      where.push("provider = :provider");
++      params.provider = filter.provider;
++    }
++    if (filter.type) {
++      where.push("type = :type");
++      params.type = filter.type;
++    }
++    if (filter.from) {
++      where.push("received_at >= :from");
++      params.from = filter.from;
++    }
++    if (filter.to) {
++      where.push("received_at < :to");
++      params.to = filter.to;
++    }
++
+     const rows = this.db
+       .prepare(
+         `SELECT * FROM events
+-         WHERE (:status IS NULL OR status = :status)
+-         ORDER BY received_at DESC, rowid DESC
+-         LIMIT :limit`,
++         ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
++         ORDER BY ${filter.orderBy}
++         LIMIT :limit OFFSET :offset`,
+       )
+-      .all({ status: filter.status ?? null, limit: filter.limit });
++      .all(params);
+ 
+-    return rows.map(
++    // We fetch one extra row to know whether there is another page.
++    const hasMore = rows.length > filter.limit;
++    const items = rows.slice(0, filter.limit).map(
+       (row): StoredEvent => ({
+         id: row.id as string,
+         provider: row.provider as string,
+@@ -204,6 +249,11 @@ export class EventService {
+         processedAt: row.processed_at as string | null,
+       }),
+     );
++
++    return {
++      items,
++      nextCursor: hasMore ? encodeCursor(offset + filter.limit) : null,
++    };
+   }
+ 
+   get(id: string): StoredEvent {
+diff --git a/test/webhooks.test.ts b/test/webhooks.test.ts
+index 0db2461..99516bb 100644
+--- a/test/webhooks.test.ts
++++ b/test/webhooks.test.ts
+@@ -115,3 +115,89 @@ describe("acme webhooks", () => {
+     assert.equal(ctx.publisher.published.length, 2);
+   });
+ });
++
++describe("GET /admin/events", () => {
++  let ctx: TestContext;
++
++  beforeEach(() => {
++    ctx = testApp();
++  });
++
++  afterEach(async () => {
++    await ctx.app.close();
++  });
++
++  const listEvents = (query: string) =>
++    ctx.app.inject({
++      method: "GET",
++      url: `/admin/events?${query}`,
++      headers: ADMIN,
++    });
++
++  it("filters by type and provider", async () => {
++    await postWebhook(ctx.app, acmeEvent());
++    await postWebhook(
++      ctx.app,
++      acmeEvent({
++        id: "evt_002",
++        type: "refund.created",
++        data: { paymentId: "pay_001", amountCents: 2_500, currency: "USD" },
++      }),
++    );
++
++    const response = await listEvents("type=refund.created&provider=acme");
++    assert.equal(response.statusCode, 200);
++    const { items, nextCursor } = response.json();
++    assert.deepEqual(
++      items.map((event: { externalId: string }) => event.externalId),
++      ["evt_002"],
++    );
++    assert.equal(nextCursor, null);
++  });
++
++  it("pages through every event with the cursor", async () => {
++    const ids = ["evt_001", "evt_002", "evt_003", "evt_004", "evt_005"];
++    for (const [index, id] of ids.entries()) {
++      await postWebhook(
++        ctx.app,
++        acmeEvent({
++          id,
++          data: {
++            paymentId: `pay_00${index + 1}`,
++            amountCents: 1_000,
++            currency: "USD",
++          },
++        }),
++      );
++    }
++
++    const seen: string[] = [];
++    let cursor: string | null = null;
++    let pages = 0;
++    do {
++      const response = await listEvents(
++        cursor ? `limit=2&cursor=${cursor}` : "limit=2",
++      );
++      assert.equal(response.statusCode, 200);
++      const page = response.json();
++      seen.push(
++        ...page.items.map((event: { externalId: string }) => event.externalId),
++      );
++      cursor = page.nextCursor;
++      pages++;
++    } while (cursor);
++
++    assert.equal(pages, 3);
++    assert.deepEqual(seen, ids);
++  });
++
++  it("rejects an unknown provider and a malformed cursor", async () => {
++    const provider = await listEvents("provider=stripe");
++    assert.equal(provider.statusCode, 400);
++    assert.equal(provider.json().error.code, "validation_failed");
++
++    const cursor = await listEvents("cursor=bm90LWEtbnVtYmVy");
++    assert.equal(cursor.statusCode, 400);
++    assert.equal(cursor.json().error.code, "bad_request");
++  });
++});
