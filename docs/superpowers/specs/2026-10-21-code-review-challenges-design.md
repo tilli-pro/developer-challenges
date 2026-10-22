@@ -147,7 +147,6 @@ base/
     repositories/*.ts SQL
     lib/*.ts          money, ids, clock, errors
   test/*.test.ts
-  scripts/seed.ts     populates sample data
 ```
 
 - Each base has two or three deliberate rough edges (an inconsistent error
@@ -163,8 +162,9 @@ base/
 Each project has exactly four features. A feature is a realistic ticket a
 mid-level engineer might ship in a day.
 
-- Diff size: 3 to 6 files changed, 150 to 300 lines added or removed. This is
-  what a careful reviewer reads in 45 minutes.
+- Diff size: 3 to 7 files changed, 150 to 300 lines added or removed. This is
+  what a careful reviewer reads in 45 minutes. The line range is the binding
+  size for the 45-minute budget; the file count follows from the layout.
 - The PR body reads like a real one: motivation, what changed, how it was
   tested, open questions. Open questions may hint at or distract from issues.
 - Existing tests still pass on the feature branch. The PR usually adds tests,
