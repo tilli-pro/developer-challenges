@@ -86,6 +86,9 @@ test("checkFeature reports featureTest=false when the patch makes test exit 1", 
     assert.equal(row.baseTest, true);
     assert.equal(row.featureTypecheck, true);
     assert.equal(row.featureTest, false);
+    assert.ok(row.details);
+    assert.match(row.details, /^feature test:/);
+    assert.ok(row.details.split("\n").length <= 16);
   });
 });
 

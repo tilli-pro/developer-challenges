@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
-import { commitAll, git } from "../lib/git";
+import { commitAll, git, gitRaw } from "../lib/git";
 import { prepare, workDirFor } from "../lib/prepare";
 import {
   findFeature,
@@ -41,6 +41,22 @@ test("regen writes main..HEAD as changes.patch", async () => {
     assert.match(patch, /diff --git a\/src\/index\.ts/);
     assert.match(patch, /\+export const added = 1;/);
     assert.ok(patch.endsWith("\n"));
+  });
+});
+
+test("regen writes the raw diff byte for byte, keeping trailing whitespace", async () => {
+  await withTempFixtures(async (dir) => {
+    const { feature, fromDir } = await setup(dir);
+    const file = join(fromDir, "src", "index.ts");
+    await writeFile(
+      file,
+      `${await readFile(file, "utf8")}export const spaced = 1;   \n`,
+    );
+    await commitAll(fromDir, "Add constant with trailing spaces");
+    await regen({ feature, fromDir });
+    const raw = await gitRaw(["diff", "--binary", "main..HEAD"], fromDir);
+    assert.ok(raw.endsWith("+export const spaced = 1;   \n"));
+    assert.equal(await readFile(feature.patchPath, "utf8"), raw);
   });
 });
 

@@ -3,11 +3,11 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
-import { commitAll, git } from "../lib/git";
+import { commitAll, git, setGitEnvForTests } from "../lib/git";
 import { prepare, workDirFor } from "../lib/prepare";
 import { findFeature, findProject, loadProjects } from "../lib/projects";
 import { copyDir } from "../utils";
-import { withTempFixtures } from "./helpers";
+import { gitEnv, withTempFixtures } from "./helpers";
 
 const options = { install: false, force: false };
 
@@ -125,5 +125,67 @@ test("prepare commits without global git identity", async () => {
       await git(["log", "-1", "--format=%an <%ae>|%cn <%ce>"], outDir),
       "Code Review <code-review@localhost>|Code Review <code-review@localhost>",
     );
+  });
+});
+
+test("prepare ignores the global git config (signing, hooks) from process.env", async () => {
+  await withTempFixtures(async (dir) => {
+    const hooks = join(dir, "..", "hooks");
+    await mkdir(hooks);
+    await writeFile(join(hooks, "pre-commit"), "#!/bin/sh\nexit 1\n", {
+      mode: 0o755,
+    });
+    const globalConfig = join(dir, "..", "gitconfig");
+    await writeFile(
+      globalConfig,
+      `[commit]\n\tgpgsign = true\n[core]\n\thooksPath = ${hooks}\n`,
+    );
+    const previous = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    setGitEnvForTests(undefined);
+    try {
+      const project = await load(dir);
+      const outDir = workDirFor(join(dir, ".."), project);
+      await prepare({ ...options, project, outDir });
+      assert.equal(await countCommits(outDir), 1);
+      assert.equal(await git(["log", "-1", "--format=%G?"], outDir), "N");
+    } finally {
+      if (previous === undefined) {
+        delete process.env.GIT_CONFIG_GLOBAL;
+      } else {
+        process.env.GIT_CONFIG_GLOBAL = previous;
+      }
+      setGitEnvForTests(gitEnv);
+    }
+  });
+});
+
+test("prepare --force refuses to remove a directory that is not a work dir", async () => {
+  await withTempFixtures(async (dir) => {
+    const project = await load(dir);
+    const outDir = join(dir, "..", "plain");
+    await mkdir(outDir);
+    await writeFile(join(outDir, "keep.txt"), "keep\n");
+    await assert.rejects(
+      prepare({ ...options, project, outDir, force: true }),
+      /is not a prepared work dir; refusing to remove it/,
+    );
+    assert.ok(existsSync(join(outDir, "keep.txt")));
+  });
+});
+
+test("prepare does not copy sqlite database files from the base", async () => {
+  await withTempFixtures(async (dir) => {
+    const base = join(dir, "demo", "base");
+    for (const name of ["data.db", "data.db-wal", "data.db-shm"]) {
+      await writeFile(join(base, name), "sqlite");
+    }
+    const project = await load(dir);
+    const outDir = workDirFor(join(dir, ".."), project);
+    await prepare({ ...options, project, outDir });
+    assert.equal(existsSync(join(outDir, "data.db")), false);
+    assert.equal(existsSync(join(outDir, "data.db-wal")), false);
+    assert.equal(existsSync(join(outDir, "data.db-shm")), false);
+    assert.ok(existsSync(join(outDir, "src", "index.ts")));
   });
 });

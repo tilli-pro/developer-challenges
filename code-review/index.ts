@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -13,7 +14,7 @@ import {
   matchesFilters,
 } from "./lib/projects";
 import { regen } from "./lib/regen";
-import type { Feature } from "./types";
+import type { Feature, Project } from "./types";
 import { pick } from "./utils";
 
 const projectsDir = join(import.meta.dirname, "projects");
@@ -55,7 +56,19 @@ const withFilters = (command: Command) =>
       parseMinutes,
     );
 
-const printPrepared = (result: PrepareResult, feature?: Feature) => {
+type PrepareFlags = { install: boolean; force: boolean };
+
+/** Adds the shared `--no-install` and `--force` options of commands that prepare a work dir. */
+const withPrepareOptions = (command: Command) =>
+  command
+    .option("--no-install", "Skip pnpm install.")
+    .option("--force", "Replace the directory if it already exists.", false);
+
+const printPrepared = (
+  result: PrepareResult,
+  project: Project,
+  feature?: Feature,
+) => {
   console.log(`Prepared ${result.dir}`);
   console.log(`  main`);
   if (result.featureBranch) {
@@ -64,8 +77,14 @@ const printPrepared = (result: PrepareResult, feature?: Feature) => {
   if (result.diffStat) {
     console.log(`\n${result.diffStat}`);
   }
+  console.log(`\nWalkthrough: ${join(project.dir, "project.json")}`);
   if (feature) {
-    console.log(`\nAnswer key: ${join(feature.dir, "REVIEW.md")}`);
+    const answerKey = join(feature.dir, "REVIEW.md");
+    console.log(
+      existsSync(answerKey)
+        ? `Answer key: ${answerKey}`
+        : `Answer key: ${answerKey} (not present here; REVIEW.md is distributed out of band)`,
+    );
   }
 };
 
@@ -135,40 +154,41 @@ withFilters(
 
 // --- prepare ---------------------------------------------------------------
 
-program
-  .command("prepare")
-  .description(
-    "Create a git repo with the project on main and the feature on feature/<slug>.",
-  )
-  .argument("<project>", "Project slug.")
-  .argument("[feature]", "Feature slug. Omit to prepare the base only.")
-  .option("-o, --out <dir>", "Directory to create. Defaults to .work/<name>.")
-  .option("--no-install", "Skip pnpm install.")
-  .option("--force", "Replace the directory if it already exists.", false)
-  .action(
-    async (
-      projectSlug: string,
-      featureSlug: string | undefined,
-      options: { out?: string; install: boolean; force: boolean },
-    ) => {
-      const { projects } = await loadProjects(projectsDir);
-      const project = findProject(projects, projectSlug);
-      const feature = featureSlug
-        ? findFeature(project, featureSlug)
-        : undefined;
-      const outDir = options.out
-        ? resolve(options.out)
-        : workDirFor(import.meta.dirname, project, feature);
-      const result = await prepare({
-        project,
-        ...(feature && { feature }),
-        outDir,
-        install: options.install,
-        force: options.force,
-      });
-      printPrepared(result, feature);
-    },
-  );
+withPrepareOptions(
+  program
+    .command("prepare")
+    .description(
+      "Create a git repo with the project on main and the feature on feature/<slug>.",
+    )
+    .argument("<project>", "Project slug.")
+    .argument("[feature]", "Feature slug. Omit to prepare the base only.")
+    .option(
+      "-o, --out <dir>",
+      "Directory to create. Defaults to .work/<name>.",
+    ),
+).action(
+  async (
+    projectSlug: string,
+    featureSlug: string | undefined,
+    options: PrepareFlags & { out?: string },
+  ) => {
+    const { projects } = await loadProjects(projectsDir);
+    const project = findProject(projects, projectSlug);
+    const feature = featureSlug ? findFeature(project, featureSlug) : undefined;
+    const outDir = options.out
+      ? resolve(options.out)
+      : workDirFor(import.meta.dirname, project, feature);
+    const result = await prepare({
+      project,
+      ...(feature && { feature }),
+      outDir,
+      install: options.install,
+      force: options.force,
+      cliRoot: import.meta.dirname,
+    });
+    printPrepared(result, project, feature);
+  },
+);
 
 // --- regen -----------------------------------------------------------------
 
@@ -226,6 +246,14 @@ const printCheckRows = (rows: CheckRow[]) => {
     if (row.error) {
       console.log(`    ${row.error}`);
     }
+    if (row.details) {
+      console.log(
+        row.details
+          .split("\n")
+          .map((line) => `    ${line}`)
+          .join("\n"),
+      );
+    }
   });
 };
 
@@ -269,11 +297,13 @@ program
 
 // --- random ----------------------------------------------------------------
 
-withFilters(
-  program
-    .command("random")
-    .description("Prepare a random review feature, optionally filtered."),
-).action(async (options: Filters) => {
+withPrepareOptions(
+  withFilters(
+    program
+      .command("random")
+      .description("Prepare a random review feature, optionally filtered."),
+  ),
+).action(async (options: Filters & PrepareFlags) => {
   const { projects } = await loadProjects(projectsDir);
   const entries = projects.flatMap((project) =>
     project.features
@@ -289,10 +319,11 @@ withFilters(
     project,
     feature,
     outDir: workDirFor(import.meta.dirname, project, feature),
-    install: true,
-    force: false,
+    install: options.install,
+    force: options.force,
+    cliRoot: import.meta.dirname,
   });
-  printPrepared(result, feature);
+  printPrepared(result, project, feature);
 });
 
 program.parseAsync().catch((error: unknown) => {
